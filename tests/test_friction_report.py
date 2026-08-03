@@ -6,8 +6,13 @@ Run with: python3 -m unittest discover tests
 Covers the pure parsing/normalization helpers and an end-to-end pass over a
 synthetic transcript so the attachment-parsing and toolUseID join are pinned.
 """
+import collections
+import contextlib
 import datetime as dt
+import io
 import json
+import subprocess
+import sys
 import tempfile
 import unittest
 from importlib import util
@@ -38,8 +43,13 @@ class CategorizeTests(unittest.TestCase):
         self.assertEqual(set(cats), {'outside', 'expand', 'untracked'})
         self.assertEqual(cats['expand'], ['$f'])
 
-    def test_allow_reason_has_no_buckets(self):
-        self.assertEqual(fr.categorize("Guarded commands target workspace/pipe only"), {})
+    def test_unrecognized_reason_buckets_as_other(self):
+        self.assertEqual(fr.categorize("Guarded commands target workspace/pipe only"),
+                         {'other': []})
+
+    def test_another_guards_reason_buckets_as_other(self):
+        self.assertEqual(fr.categorize("Command runs against the production cluster."),
+                         {'other': []})
 
 
 class NormalizeTests(unittest.TestCase):
@@ -160,34 +170,77 @@ class StalenessTests(unittest.TestCase):
             self.assertEqual(s["available"], "1.5.0")
 
 
-class EndToEndTests(unittest.TestCase):
-    """Synthetic transcript: one tool_use + one matching hook attachment."""
+class PrintTextTests(unittest.TestCase):
+    """The path ranking is workspace-guard-scoped; say so under --plugin all."""
 
-    def _transcript(self, tmp):
-        path = Path(tmp) / "s.jsonl"
-        tool_use = {"message": {"content": [
-            {"type": "tool_use", "name": "Bash", "id": "toolu_X",
-             "input": {"command": "cd /etc && grep root passwd"}}]}}
-        attach = {
-            "type": "attachment", "cwd": "/home/u/proj",
-            "timestamp": "2026-06-14T12:00:00.000Z",
-            "attachment": {
-                "type": "hook_success", "hookName": "PreToolUse:Bash",
-                "toolUseID": "toolu_X",
-                "command": 'python3 ".../scripts/bash-workspace-guard.py"',
-                "stdout": json.dumps({"hookSpecificOutput": {
-                    "permissionDecision": "ask",
-                    "permissionDecisionReason":
-                        "Outside-workspace path(s): passwd. Fix: x."}}),
-            }}
-        path.write_text(json.dumps(tool_use) + "\n" + json.dumps(attach) + "\n")
-        return path
+    REPORT = {
+        'total': 2,
+        'decisions': collections.Counter({'ask': 2}),
+        'plugins': collections.Counter({'workspace-guard': 1, 'prod-guard': 1}),
+        'categories': collections.Counter({'outside': 1, 'other': 1}),
+        'paths': collections.Counter({'passwd': 1}),
+        'commands': collections.Counter({'grep root passwd': 1}),
+    }
+
+    def _render(self, plugin):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            fr.print_text(self.REPORT, 15, None, plugin)
+        return buf.getvalue()
+
+    def test_all_plugins_labels_path_scope(self):
+        out = self._render('all')
+        self.assertIn("Top offending paths (workspace-guard only, top 15):", out)
+        self.assertIn('"other" =', out)
+
+    def test_single_plugin_stays_unlabeled(self):
+        out = self._render('workspace-guard')
+        self.assertIn("Top offending paths (top 15):", out)
+        self.assertNotIn('"other" =', out)
+
+    def test_header_says_counts_are_floors(self):
+        # A hook that returns early emits nothing and so is invisible here; the
+        # header has to say so or a hidden path reads as a quiet guard (96).
+        out = " ".join(self._render('workspace-guard').split())
+        self.assertIn("coverage: Emitted decisions only", out)
+        self.assertIn("these totals are floors", out)
+
+    def test_all_plugins_disclaims_the_cross_guard_ranking(self):
+        out = " ".join(self._render('all').split())
+        self.assertIn("not a like-for-like ranking", out)
+        self.assertNotIn("like-for-like",
+                         " ".join(self._render('workspace-guard').split()))
+
+
+def write_transcript(tmp):
+    """Synthetic transcript: one tool_use + one matching hook attachment."""
+    path = Path(tmp) / "s.jsonl"
+    tool_use = {"message": {"content": [
+        {"type": "tool_use", "name": "Bash", "id": "toolu_X",
+         "input": {"command": "cd /etc && grep root passwd"}}]}}
+    attach = {
+        "type": "attachment", "cwd": "/home/u/proj",
+        "timestamp": "2026-06-14T12:00:00.000Z",
+        "attachment": {
+            "type": "hook_success", "hookName": "PreToolUse:Bash",
+            "toolUseID": "toolu_X",
+            "command": 'python3 ".../scripts/bash-workspace-guard.py"',
+            "stdout": json.dumps({"hookSpecificOutput": {
+                "permissionDecision": "ask",
+                "permissionDecisionReason":
+                    "Outside-workspace path(s): passwd. Fix: x."}}),
+        }}
+    path.write_text(json.dumps(tool_use) + "\n" + json.dumps(attach) + "\n")
+    return path
+
+
+class EndToEndTests(unittest.TestCase):
 
     def test_join_and_report(self):
         with tempfile.TemporaryDirectory() as tmp:
-            self._transcript(tmp)
-            decs = list(fr.iter_decisions([str(Path(tmp) / "s.jsonl")],
-                                          'workspace-guard', None, ''))
+            write_transcript(tmp)
+            decs, _ = fr.scan([str(Path(tmp) / "s.jsonl")],
+                              'workspace-guard', None, '')
             self.assertEqual(len(decs), 1)
             d = decs[0]
             self.assertEqual(d['decision'], 'ask')
@@ -198,10 +251,129 @@ class EndToEndTests(unittest.TestCase):
 
     def test_plugin_filter_excludes_other_guard(self):
         with tempfile.TemporaryDirectory() as tmp:
-            self._transcript(tmp)
-            decs = list(fr.iter_decisions([str(Path(tmp) / "s.jsonl")],
-                                          'branch-guard', None, ''))
+            write_transcript(tmp)
+            decs, _ = fr.scan([str(Path(tmp) / "s.jsonl")],
+                              'branch-guard', None, '')
             self.assertEqual(decs, [])
+
+    def test_all_plugins_categories_sum_to_friction(self):
+        # Under --plugin all another guard's prompt has no recognizable reason;
+        # it must land in 'other' rather than vanish from the table (issue 96).
+        with tempfile.TemporaryDirectory() as tmp:
+            path = write_transcript(tmp)
+            other = {
+                "type": "attachment", "cwd": "/home/u/proj",
+                "timestamp": "2026-06-14T12:01:00.000Z",
+                "attachment": {
+                    "type": "hook_success", "hookName": "PreToolUse:Bash",
+                    "toolUseID": "toolu_Y",
+                    "command": 'python3 ".../scripts/bash-foreground-guard.py"',
+                    "stdout": json.dumps({"hookSpecificOutput": {
+                        "permissionDecision": "ask",
+                        "permissionDecisionReason": "Long-running foreground command."}}),
+                }}
+            with path.open("a") as fh:
+                fh.write(json.dumps(other) + "\n")
+
+            decs, _ = fr.scan([str(path)], 'all', None, '')
+            report = fr.build_report(decs, raw=True)
+            self.assertEqual(report['plugins']['foreground-guard'], 1)
+            self.assertEqual(sum(report['categories'].values()), 2)
+            self.assertEqual(report['categories']['other'], 1)
+            # Paths stay workspace-guard-scoped: the other guard adds no tokens.
+            self.assertEqual(list(report['paths']), ['passwd'])
+
+
+class EmptyResultTests(unittest.TestCase):
+    """An empty result must name the filter that emptied it (issue 97), so a
+    typo can't read the same as a guard with zero friction."""
+
+    def _survey(self, tmp, plugin, cutoff=None, repo=''):
+        write_transcript(tmp)
+        decs, survey = fr.scan([str(Path(tmp) / "s.jsonl")], plugin, cutoff, repo)
+        self.assertEqual(decs, [])
+        return survey
+
+    def test_unknown_plugin_names_the_labels_present(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            s = self._survey(tmp, 'pr-sentinel')
+            notes = "\n".join(fr.explain_empty(s, 'pr-sentinel', 'all', ''))
+            self.assertIn("--plugin 'pr-sentinel' matched no guard", notes)
+            self.assertIn("workspace-guard (1)", notes)
+            # A label mismatch is not the only cause: a guard that emitted
+            # nothing is equally absent from the labels we saw.
+            self.assertIn("emitted nothing", notes)
+
+    def test_unknown_repo_blames_the_repo_filter(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            s = self._survey(tmp, 'workspace-guard', repo='no-such-repo')
+            notes = "\n".join(fr.explain_empty(s, 'workspace-guard', 'all',
+                                               'no-such-repo'))
+            self.assertIn("--repo 'no-such-repo' matched no cwd", notes)
+            self.assertIn("workspace-guard's 1 decisions", notes)
+
+    def test_empty_window_blames_since_and_dates_the_latest(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cutoff = dt.datetime(2026, 7, 1, tzinfo=dt.timezone.utc)
+            s = self._survey(tmp, 'workspace-guard', cutoff=cutoff)
+            notes = "\n".join(fr.explain_empty(s, 'workspace-guard', '7d', ''))
+            self.assertIn("--since 7d excluded all 1 matching decisions", notes)
+            self.assertIn("2026-06-14", notes)
+
+    def test_no_decisions_at_all_says_so(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / "empty.jsonl").write_text("")
+            decs, s = fr.scan([str(Path(tmp) / "empty.jsonl")], 'all', None, '')
+            self.assertEqual(decs, [])
+            notes = "\n".join(fr.explain_empty(s, 'all', 'all', ''))
+            self.assertIn("no guard decisions in the scanned transcripts at all",
+                          notes.lower())
+
+
+class ExitCodeTests(unittest.TestCase):
+    """A filter nothing can match exits non-zero; a real zero exits 0."""
+
+    def _run(self, tmp, *extra):
+        empty_plugins = Path(tmp) / "plugins"
+        empty_plugins.mkdir(exist_ok=True)
+        return subprocess.run(
+            [sys.executable, str(SCRIPT), "--transcripts", tmp,
+             "--plugins-dir", str(empty_plugins), *extra],
+            capture_output=True, text=True)
+
+    def test_unknown_plugin_exits_two(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            write_transcript(tmp)
+            p = self._run(tmp, "--since", "all", "--plugin", "totally-bogus-name")
+            self.assertEqual(p.returncode, 2)
+            self.assertIn("Guards found: workspace-guard (1)", p.stdout)
+
+    def test_known_plugin_with_empty_window_exits_zero(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            write_transcript(tmp)
+            p = self._run(tmp, "--plugin", "workspace-guard", "--since", "1h")
+            self.assertEqual(p.returncode, 0)
+            self.assertIn("--since 1h excluded all 1 matching decisions", p.stdout)
+
+    def test_json_carries_the_explanation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            write_transcript(tmp)
+            p = self._run(tmp, "--since", "all", "--plugin",
+                          "totally-bogus-name", "--json")
+            self.assertEqual(p.returncode, 2)
+            out = json.loads(p.stdout)
+            self.assertEqual(out['total'], 0)
+            self.assertEqual(out['guards_seen'], {'workspace-guard': 1})
+            self.assertTrue(out['empty_because'])
+
+    def test_json_carries_the_coverage_caveat(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            write_transcript(tmp)
+            p = self._run(tmp, "--since", "all", "--plugin", "all", "--json")
+            self.assertEqual(p.returncode, 0)
+            out = json.loads(p.stdout)
+            self.assertEqual(len(out['coverage']), 2)
+            self.assertIn("floors", out['coverage'][0])
 
 
 if __name__ == "__main__":

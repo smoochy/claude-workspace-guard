@@ -18,6 +18,34 @@ The report only **reads** that already-persisted local data. It adds no logging
 and no telemetry — keep it that way (hook-side logging would be a privacy
 regression for no added signal).
 
+## What the report cannot see
+
+Claude Code records an attachment **only when the hook writes to stdout**. A
+hook run that stays silent leaves no record at all — not an empty one. Measured
+on one workstation: of 20,708 `PreToolUse:Bash` attachments, 37 had empty
+stdout, and all 37 came from a shell hook the report skips anyway.
+
+So the scan cannot see:
+
+- **Silent defers.** workspace-guard defers on every command it doesn't guard,
+  which is most of them. Those runs are absent, not counted as `defer`.
+- **Unreached code paths.** A guard that returns before analysis on some class
+  of payload records nothing for that class. foreground-guard returns early when
+  the payload carries `run_in_background: true`, so backgrounded polls are
+  invisible ([foreground-guard
+  #15](https://github.com/karlkfi/claude-foreground-guard/issues/15)).
+- **A guard that never ran** — misconfigured, crashed, or not installed.
+
+Every total is therefore a **floor**, and the three cases above are
+indistinguishable from a guard that saw the traffic and stayed quiet. The report
+prints a `coverage:` line under the header saying so, and `--json` carries the
+same sentences in a `coverage` field.
+
+The consequence worth remembering: because each guard emits on its own terms —
+some emit an explicit `allow` for traffic they've cleared, others emit only when
+they need to prompt — the per-guard totals on the `plugins:` line are **not
+comparable to each other**. Only ask/deny counts are, and only as floors.
+
 ## Usage
 
 ```
@@ -35,15 +63,59 @@ Flags: `--transcripts` (root, default `~/.claude/projects`), `--plugin`
 `--plugins-dir` (Claude Code plugins dir, default `~/.claude/plugins`; used only
 for the stale-install check below).
 
+A `--plugin` value is a **guard label**, derived from the hook script's filename
+minus a `bash-` prefix — not the plugin name. They coincide for the guards whose
+hook is `bash-<name>.py`, but not in general: pr-sentinel's hook is
+`pr-sentinel-guard.py`, so its label is `pr-sentinel-guard`. Labels you never
+installed can also appear, since any `PreToolUse:Bash` hook running a `.py`
+script gets one.
+
+## When nothing matches
+
+An empty result names the filter that emptied it, so a typo can't read like a
+guard with zero friction (issue 97):
+
+```
+$ python3 scripts/friction-report.py --plugin pr-sentinel --since all
+No guard decisions found for the given filters.
+--plugin 'pr-sentinel' matched no guard in the scanned transcripts.
+  Guards found: workspace-guard (16563), branch-guard (3045), pr-sentinel-guard (535), ...
+```
+
+A label can be missing for a second reason the message also names: the guard is
+installed but emitted nothing in the scanned transcripts, which leaves no record
+to derive a label from.
+
+The filters are checked in order — `--plugin`, then `--repo`, then `--since` —
+and the first one that drops everything is the one reported; the `--since` case
+dates the most recent matching decision so you know how far to widen. `--json`
+carries the same signal in `guards_seen` and `empty_because` (`null` when the
+report is non-empty).
+
+**Exit codes.** A `--plugin` or `--repo` value nothing in the transcripts can
+match exits **2** — the question is unanswerable as asked. A filter that does
+match the data but over an empty window exits **0**, as does a fresh setup with
+no recorded decisions at all: those are real answers of zero.
+
 ## What it reports
 
-- **Outcome mix** — allow / ask / deny / defer counts and the ask+deny share
-  (the friction ratio). `defer` is inferred from a silent hook (empty stdout).
+- **Outcome mix** — allow / ask / deny counts and the ask+deny share (the
+  friction ratio), over the decisions a hook actually emitted (see [What the
+  report cannot see](#what-the-report-cannot-see)). A `defer` bucket exists for
+  an attachment with empty stdout, but silent runs aren't recorded at all, so in
+  practice it stays at zero.
 - **By category** — `outside` / `expand` / `untracked`, the buckets
-  `build_reason()` emits in `scripts/bash-workspace-guard.py`.
-- **Top offending paths** — normalized by default so per-session temp paths
-  (e.g. `/private/tmp/claude-NNN/...`) collapse into one row; `--raw` to see
-  exact tokens.
+  `build_reason()` emits in `scripts/bash-workspace-guard.py`, plus `other` for
+  any prompt whose reason matches none of them. Under `--plugin all` that's
+  where the companion guards' prompts land, so the table still sums to the
+  friction count in the header (a reason can match more than one bucket, so the
+  sum can exceed it).
+- **Top offending paths** — only `outside`/`expand`/`untracked` reasons carry
+  path tokens, so this ranking is workspace-guard-only even under
+  `--plugin all`, where its heading says so (`--json` carries the same signal in
+  `paths_scope`). Normalized by default so per-session temp paths (e.g.
+  `/private/tmp/claude-NNN/...`) collapse into one row; `--raw` to see exact
+  tokens.
 - **Top triggering commands** — via the `toolUseID` join, so you see what the
   agent was doing when it got prompted.
 - **Stale-install banner** — when the installed plugin version
@@ -61,6 +133,9 @@ for the stale-install check below).
 A token that surfaces in **top paths** but is not a real file (e.g. a bare `2`
 from `2>/dev/null`) is a tokenizer false positive worth fixing. A high `expand`
 count points at `~`/`$VAR` arguments; a high `untracked` count points at `cd`
-into untracked directories. Cross-check candidate fixes against the
+into untracked directories. A large `other` under `--plugin all` means most of
+your friction comes from a companion guard — read the `plugins:` line to see
+which, then run that guard's own copy of this report to break it down.
+Cross-check candidate fixes against the
 secure-by-default rules before changing the hook — a fix that cuts prompts by
 loosening the boundary is a regression, not a win.

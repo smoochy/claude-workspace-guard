@@ -929,16 +929,23 @@ class SessionTmpPathTests(unittest.TestCase):
     """Per-session allow for Claude Code's own task-output scratch (Q21)."""
 
     def setUp(self):
-        self.uid = os.getuid()
         self.root = guard.claude_tmp_root()
         self.sess = "11111111-2222-3333-4444-555555555555"
         # A realistic per-session task-output path under the temp root.
         self.path = os.path.join(
             self.root, "-Users-me-proj", self.sess, "tasks", "abc.output")
 
+    @unittest.skipUnless(hasattr(os, "getuid"), "POSIX-only layout")
     def test_claude_tmp_root_is_realpath_of_uid_dir(self):
         self.assertEqual(
-            self.root, os.path.realpath("/tmp/claude-%d" % self.uid))
+            self.root, os.path.realpath("/tmp/claude-%d" % os.getuid()))
+
+    @unittest.skipIf(hasattr(os, "getuid"), "Windows-only layout")
+    def test_claude_tmp_root_is_realpath_of_temp_claude_dir(self):
+        # No per-UID suffix on Windows: the per-user temp dir already scopes it.
+        self.assertEqual(
+            self.root,
+            os.path.realpath(os.path.join(tempfile.gettempdir(), "claude")))
 
     def test_current_session_path_allowed(self):
         self.assertTrue(
@@ -2370,7 +2377,8 @@ class HookEndToEndTests(unittest.TestCase):
     # /tmp/claude-<uid>/<encoded-project>/<session-uuid>/tasks/<id>.output and
     # the agent reads it back. That is the agent's own scratch, not the boundary
     # this hook guards, so it's allowed — but ONLY for the current session.
-    # Paths use os.getuid() so they match what the script computes; the dirs
+    # Paths come from guard.claude_tmp_root() so they match what the script
+    # computes on this platform (the Windows root has no uid suffix); the dirs
     # need not exist (the script resolves lexically and the subprocess never
     # execs the command). Synthetic project/uuid segments, per the repo rule on
     # never using real outside paths in fixtures.
@@ -4603,8 +4611,25 @@ class LiteralForItemTests(unittest.TestCase):
     def test_dollar_item_impure(self):
         self.assertIsNone(guard.literal_for_item("$x"))
 
-    def test_glob_item_impure(self):
-        self.assertIsNone(guard.literal_for_item("*.md"))
+    def test_glob_item_kept_as_pattern(self):
+        # A pattern resolves where every path it expands to resolves (issue 99).
+        for v in ("*.md", "docs/*.md", "doc?/plan", "docs/[ab]*.md"):
+            self.assertEqual(guard.literal_for_item(v), v)
+
+    def test_escaping_glob_kept_and_resolves_outside(self):
+        # `../*.md` needs no separate containment rule — kept as the pattern, it
+        # resolves above the root and the caller prompts on it.
+        self.assertEqual(guard.literal_for_item("../*.md"), "../*.md")
+        self.assertEqual(guard.literal_for_item("/etc/*.conf"), "/etc/*.conf")
+
+    def test_glob_with_expansion_still_impure(self):
+        # Keeping `*?[` doesn't relax anything else in the purity test.
+        for v in ("$x/*.md", "a b/*.md", "`x`/*.md", "a:b/*.md"):
+            self.assertIsNone(guard.literal_for_item(v), v)
+
+    def test_glob_assignment_rhs_still_impure(self):
+        # The relaxation is for-list items only; an assignment RHS is unchanged.
+        self.assertIsNone(guard.literal_assignment_value("docs/*.md"))
 
     def test_brace_item_impure(self):
         # Unlike an assignment RHS, a for-list item IS brace-expanded by bash,
@@ -4634,10 +4659,15 @@ class ForLoopBindingTests(unittest.TestCase):
             guard.for_loop_binding(["for", "f", "in", "a", "$x"]),
             ("f", None))
 
-    def test_glob_item_poisons(self):
+    def test_glob_item_binds_to_pattern(self):
         self.assertEqual(
             guard.for_loop_binding(["for", "f", "in", "docs/*.md"]),
-            ("f", None))
+            ("f", ["docs/*.md"]))
+
+    def test_mixed_literal_and_glob_list_binds(self):
+        self.assertEqual(
+            guard.for_loop_binding(["for", "f", "in", "a", "docs/*.md"]),
+            ("f", ["a", "docs/*.md"]))
 
     def test_for_name_without_in_poisons(self):
         # `for f; do …` iterates "$@" — unresolvable.
@@ -4927,10 +4957,57 @@ class ForLoopPropagationEndToEndTests(unittest.TestCase):
         self._decision(
             "for f in a b\ndo\n  cat wf/${f}.yml\ndone", "allow")
 
-    # --- uncertainty keeps today's ask ---------------------------------------
+    # --- glob items resolve as their own pattern (issue 99) -------------------
 
-    def test_glob_item_poisons(self):
-        self._decision("for f in wf/*.yml\ndo\n  cat $f\ndone", "ask")
+    def test_glob_item_allow(self):
+        # The issue's largest prompt source: an in-workspace survey loop.
+        self._decision("for f in wf/*.yml\ndo\n  cat $f\ndone", "allow")
+        self._decision(
+            'for f in docs/*.md\ndo\n  echo "=== $f"\n  grep -E "^# " "$f"\ndone',
+            "allow")
+
+    def test_glob_item_other_metachars_allow(self):
+        self._decision("for f in w?/[ab]*.yml\ndo\n  cat $f\ndone", "allow")
+
+    def test_escaping_glob_item_ask(self):
+        # A pattern that resolves above the root prompts on the pattern itself —
+        # no expansion needed to see it escapes.
+        out = self._decision(
+            "for f in ../../../etc/q99-fake/*.conf\ndo\n  cat $f\ndone", "ask")
+        self.assertIn(
+            "/etc/q99-fake",
+            out["hookSpecificOutput"]["permissionDecisionReason"])
+
+    def test_absolute_glob_item_ask(self):
+        self._decision("for f in /etc/q99-fake/*.conf\ndo\n  cat $f\ndone", "ask")
+
+    def test_glob_item_escaping_body_path_flagged(self):
+        # `$f` is in-workspace, but the body climbs out of it. The pattern has
+        # the same segment count as every path it expands to, so it climbs
+        # exactly as far as bash will — here to the fixture's parent, which is
+        # the host temp dir (deny), not merely outside (ask).
+        out = self._decision(
+            "for f in wf/*.yml\ndo\n  cat $f/../../../q99-fake\ndone", "deny")
+        self.assertIn(
+            "wf/*.yml/../../../q99-fake",
+            out["hookSpecificOutput"]["permissionDecisionReason"])
+
+    def test_glob_item_reassigned_in_body_ask(self):
+        # The glob binding is poisoned by the same rules as a literal one.
+        self._decision(
+            "for f in wf/*.yml\ndo\n  read f\n  cat $f\ndone", "ask")
+
+    def test_glob_item_outside_sibling_in_list_ask(self):
+        # One outside item taints the loop, glob or not.
+        self._decision(
+            "for f in wf/*.yml /etc/q99-fake\ndo\n  cat $f\ndone", "ask")
+
+    def test_glob_item_after_cd_outside_deny(self):
+        # The pattern is relative, so it tracks the cd like any relative path.
+        self._decision(
+            "cd /tmp/q99-fake && for f in *.log\ndo\n  cat $f\ndone", "deny")
+
+    # --- uncertainty keeps today's ask ---------------------------------------
 
     def test_brace_item_poisons(self):
         # bash brace-expands a for-list item; treating `{a,b}` literally would
@@ -5062,6 +5139,60 @@ class PluginWiringTests(unittest.TestCase):
             any("bash-workspace-guard.py" in c for c in commands),
             "the guard script is not registered as a hook command",
         )
+
+    # --- scripts/run-python-hook.cmd -----------------------------------------
+
+    def test_hook_shim_is_executable(self):
+        # The hook command execs the shim directly, so a missing execute bit
+        # means exit 126. Claude Code treats that as a non-blocking hook error,
+        # which leaves the guard enforcing nothing with no visible symptom.
+        if os.name == "nt":
+            self.skipTest("POSIX permission bits")
+        shim = REPO / "scripts" / "run-python-hook.cmd"
+        self.assertTrue(shim.is_file(), "missing scripts/run-python-hook.cmd")
+        self.assertTrue(os.access(shim, os.X_OK),
+                        "run-python-hook.cmd is not executable")
+
+    def test_hook_shim_has_lf_line_endings(self):
+        # CRLF makes the POSIX half of the polyglot a syntax error.
+        shim = REPO / "scripts" / "run-python-hook.cmd"
+        self.assertNotIn(b"\r", shim.read_bytes(),
+                         "run-python-hook.cmd must stay LF-only")
+
+    def test_gitattributes_pins_cmd_line_endings(self):
+        # Without the pin, a clone under core.autocrlf=true rewrites the shim.
+        path = REPO / ".gitattributes"
+        self.assertTrue(path.is_file(), "missing .gitattributes")
+        self.assertIn("*.cmd text eol=lf", path.read_text())
+
+    def test_hook_shim_emits_the_same_decision_as_a_direct_run(self):
+        if os.name == "nt":
+            self.skipTest("the shim runs through cmd.exe on Windows")
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = os.path.realpath(tmp)
+            payload = json.dumps({
+                "tool_name": "Bash",
+                "cwd": workspace,
+                "tool_input": {"command": "cat ../q94-fake-target"},
+            })
+            env = os.environ.copy()
+            env["CLAUDE_PROJECT_DIR"] = workspace
+            shim = REPO / "scripts" / "run-python-hook.cmd"
+            # Claude Code runs hook commands through a shell, and the shim has
+            # no shebang -- it relies on the shell retrying an ENOEXEC exec as
+            # /bin/sh. Launching it any other way doesn't exercise that.
+            outputs = []
+            for argv in ([sys.executable, str(SCRIPT)],
+                         ["/bin/sh", "-c", f'"{shim}" bash-workspace-guard.py']):
+                r = subprocess.run(argv, input=payload, capture_output=True,
+                                   text=True, env=env, timeout=10)
+                self.assertEqual(r.returncode, 0,
+                                 f"{argv[0]} exited {r.returncode}: "
+                                 f"{r.stderr!r}")
+                outputs.append(r.stdout)
+            # Two silent defers would compare equal, so pin the decision too.
+            self.assertIn("permissionDecision", outputs[1])
+            self.assertEqual(outputs[0], outputs[1])
 
     # --- .claude-plugin/*.json -----------------------------------------------
 

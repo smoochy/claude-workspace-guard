@@ -27,7 +27,10 @@ python3 "${CLAUDE_PLUGIN_ROOT}/scripts/friction-report.py" --repo "$(basename "$
 
 This reports the friction ratio (ask+deny share), a **By category** breakdown,
 the **top offending paths**, and the **top triggering commands** for the current
-project over the last 7 days. Useful adjustments:
+project over the last 7 days. The ratio's denominator counts only decisions the
+hook emitted — a silent defer on an unguarded command leaves no record — so it
+is a share of the hook's own decisions, not of every Bash call. Useful
+adjustments:
 
 - `--since 24h` / `--since 2026-06-01` / `--since all` — widen or narrow the
   window (default `7d`).
@@ -41,6 +44,11 @@ transcripts …", or prints "No guard decisions found" (a fresh setup with no
 recorded prompts yet), skip the data step and diagnose from the **most recent
 prompts in this session** instead — the hook's reason text names the offending
 path and the fix for each.
+
+An empty report exiting **2** means a filter matched nothing that exists — the
+lines below "No guard decisions found" name which one and, for `--plugin`, list
+the guard labels the transcripts actually contain. Fix the flag and re-run
+rather than treating it as zero friction.
 
 Either way, map what you find to a cause. The report's category names line up
 one-to-one with these:
