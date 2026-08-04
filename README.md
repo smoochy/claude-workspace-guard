@@ -1,6 +1,6 @@
 # workspace-guard
 
-**Path-aware bash permissions for Claude Code.**
+**Path-aware shell permissions for Claude Code.**
 
 [![release](https://img.shields.io/github/v/release/karlkfi/claude-workspace-guard)](https://github.com/karlkfi/claude-workspace-guard/releases) [![tests](https://img.shields.io/github/actions/workflow/status/karlkfi/claude-workspace-guard/tests.yml?branch=main&label=tests)](https://github.com/karlkfi/claude-workspace-guard/actions/workflows/tests.yml) [![License: MIT](https://img.shields.io/github/license/karlkfi/claude-workspace-guard.svg)](LICENSE) [![Claude Code plugin](https://img.shields.io/badge/Claude_Code-plugin-7e57c2)](#install)
 
@@ -12,11 +12,11 @@ outside your repo into `jq`. The default `Bash(grep:*)` permission rules can't
 tell these apart from the dozens of in-repo greps Claude runs every session —
 they either trust every invocation or prompt on every one.
 
-workspace-guard is a `PreToolUse` hook for `Bash` — and for Claude's native file
-tools (`Read`, `Grep`, `Glob`, `Edit`, `Write`, …) — that parses the command,
-finds its file arguments, and asks for confirmation only when a path resolves
-outside your project root (`$CLAUDE_PROJECT_DIR`). In-repo reads and pure
-pipelines run silently.
+workspace-guard is a `PreToolUse` hook for the shell tools (`Bash` and
+`PowerShell`) — and for Claude's native file tools (`Read`, `Grep`, `Glob`,
+`Edit`, `Write`, …) — that parses the command, finds its file arguments, and
+asks for confirmation only when a path resolves outside your project root
+(`$CLAUDE_PROJECT_DIR`). In-repo reads and pure pipelines run silently.
 
 ![Claude Code's permission prompt when grep targets a file outside the project root](docs/img/ask-prompt.png)
 
@@ -43,7 +43,7 @@ The hook produces one of four outcomes:
 - **ask** — Claude Code shows its standard permission prompt for the command
   (as above). You approve or reject.
 - **deny** — the command is blocked with a constructive reason. This is the
-  default for **host-wide temp** paths (`/tmp`, `/var/tmp`, `$TMPDIR`): they're
+  default for **host-wide temp** paths (`/tmp`, `/var/tmp`, `$TMPDIR`, `%TMP%`): they're
   shared across every session and worktree and live outside the project root, so
   instead of prompting, the hook steers you to a repo-local gitignored scratch
   dir (`./tmp/`). It's also the default for **writes into a sibling checkout of
@@ -102,7 +102,9 @@ different project's scratch still asks entirely.
 | `grep foo data.txt 2>&1`             | allow    |
 | `cat <<<"/etc/foo"` (here-string)    | allow    |
 | `cat > page.html <<'EOF'` … `</div>` … `EOF` (heredoc body) | allow |
+| `cat > doc.md <<'EOF'` … `$(cat /etc/x)` … `EOF` (literal body) | allow |
 | `cat ~/proj/notes.md` (root `~/proj`) | allow   |
+| `cat /c/proj/notes.md` (Git Bash, root `C:\proj`) | allow |
 | `cd "$(git rev-parse --show-toplevel)" && cat README.md` | allow |
 | `cd "$(pwd)" && cat README.md`       | allow    |
 | `tail /tmp/claude-501/…/<this-session>/…` (own task output) | allow |
@@ -125,6 +127,8 @@ different project's scratch still asks entirely.
 | `cat $HOME/.ssh/id_rsa`              | **ask**  |
 | `cd /etc && cat passwd`              | **ask**  |
 | `echo "$(cat /etc/passwd)"` (quoted subst read) | **ask** |
+| `cat > doc.md <<EOF` … `$(cat /etc/x)` … `EOF` (expanded body) | **ask** |
+| `cat > doc.md <<EOF` … `don't` … `$(cat /etc/x)` … `EOF` (apostrophe first) | **ask** |
 | `LC_ALL=C cat /etc/passwd`           | **ask**  |
 | `until grep -q x /etc/passwd; do :; done` | **ask** |
 | `if cat /etc/passwd; then :; fi`     | **ask**  |
@@ -168,7 +172,8 @@ A naive string match would either miss real file arguments or false-positive on
 program syntax.
 
 The **deny** rows are **host-wide temp** paths — at or under `/tmp`, `/var/tmp`,
-or `$TMPDIR` after symlink resolution. They're classified from the *same*
+`$TMPDIR`, or the platform's own temp dir (`%TMP%` on Windows) after symlink
+resolution. They're classified from the *same*
 resolved paths the hook already extracts, so `/tmp` appearing only as text (a
 grep pattern, a commit message, an `echo` string) is never matched. The deny is
 the default and can be softened to `ask` or narrowed with an allowlist — see
@@ -184,11 +189,62 @@ The **ask** rows assume an interactive or `default`-mode session. In full-auto
 return `deny` instead — equally blocking, with recoverable feedback for the
 agent. See [Configuration](#configuration).
 
+### The PowerShell tool
+
+Claude Code ships two shell tools, and a Windows session gets `PowerShell`
+rather than `Bash` whenever Git for Windows isn't installed — as does any
+session with `CLAUDE_CODE_USE_POWERSHELL_TOOL=1`. Both are hooked, but
+PowerShell gets its own parser and its own table. It isn't a POSIX shell: its
+escape character is a backtick, so a native path run through the POSIX tokenizer
+comes out as `C:Usersbobx` — a name that resolves *inside* the project root.
+Reads and writes are cmdlets with their own parameter grammar, and several of
+their aliases (`cat`, `rm`, `cp`, `mv`, `tee`, `sc`) collide with POSIX command
+names that take entirely different flags.
+
+Guarded cmdlets: `Get-Content`, `Select-String`, `Import-Csv`, `Import-Clixml`,
+`Set-Content`, `Add-Content`, `Out-File`, `Tee-Object`, `Export-Csv`,
+`Export-Clixml`, `Copy-Item`, `Move-Item`, `Remove-Item`, `Rename-Item`, and
+their aliases. Output redirects (`>`, `>>`, `2>`) are checked on any command.
+
+| Command                                        | Decision |
+| ---------------------------------------------- | -------- |
+| `Get-Content .\src.txt`                        | allow    |
+| `Select-String foo .\notes.md`                 | allow    |
+| `Set-Content .\out.txt "hi"`                   | allow    |
+| `Set-Location docs; Get-Content note.md`       | allow    |
+| `Set-Content out.txt @'` … `'@` (literal body) | allow    |
+| `Get-Content C:\Users\bob\.aws\credentials`    | **ask**  |
+| `Get-Content -LiteralPath C:\out\x`            | **ask**  |
+| `Set-Content -Encoding UTF8 C:\out\x "hi"`     | **ask**  |
+| `Out-File -FilePath C:\out\x`                  | **ask**  |
+| `Copy-Item .\in.txt C:\out\x`                  | **ask**  |
+| `Get-Content -Path in.txt,C:\out\x` (array)    | **ask**  |
+| `Set-Location C:\out; Get-Content secret.txt`  | **ask**  |
+| `Write-Output hi > C:\out\x` (redirect)        | **ask**  |
+| `Write-Output "$(Get-Content C:\out\x)"`       | **ask**  |
+| `Get-Content $env:USERPROFILE\x`               | **ask**  |
+| `Get-ChildItem C:\out` (not a guarded cmdlet)  | defer    |
+| `Get-Content "unterminated` (unparseable)      | defer    |
+
+Parameters bind the way PowerShell binds them: by name first — including
+unambiguous prefixes (`-Pat` is `-Path`) and the colon form (`-Path:C:\x`) —
+and only then into whatever positional slots are left, so
+`Select-String -Pattern foo C:\x` puts the file in `-Path` however the two are
+ordered. `Set-Location` and `Push-Location` are followed so a later relative
+operand resolves against the right directory; anything the hook can't follow
+(a bare `cd`, a `$var` target, `Pop-Location`) drops tracking and prompts on
+relative operands rather than guessing.
+
+A cmdlet that isn't in the table is **not checked**, and neither is a .NET call
+or a native `.exe`. See [Limitations](#limitations) for why that's the posture
+and what it costs.
+
 ### Beyond Bash: native file tools
 
-The hook is registered for Claude's native file tools as well as `Bash`, and runs
-the *same* path check on them — a native tool receives a structured path
-argument, so there's no command to parse, just a path to resolve and classify.
+The hook is registered for Claude's native file tools as well as the shell
+tools, and runs the *same* path check on them — a native tool receives a
+structured path argument, so there's no command to parse, just a path to resolve
+and classify.
 
 | Tool call                                         | Decision |
 | ------------------------------------------------- | -------- |
@@ -208,10 +264,9 @@ back its own output is never prompted. `Edit`, `Write`, `MultiEdit`, and
 `NotebookEdit` are writes, so they also pick up the sibling-checkout deny below.
 
 A path the hook can't resolve without a shell — one containing `$VAR` or a
-`~user` prefix — **defers** on these tools, since they don't shell-expand.
-`Bash` remains the only surface with full command parsing (pipelines, redirects,
-`cd` tracking, variable propagation); the native handlers are a straight
-path-in, decision-out check.
+`~user` prefix — **defers** on these tools, since they don't shell-expand. Full
+command parsing (pipelines, redirects, location tracking) belongs to the shell
+tools; the native handlers are a straight path-in, decision-out check.
 
 ### Worktree-aware sibling-checkout deny
 
@@ -365,6 +420,13 @@ After upgrading either way:
 
 ## How it works
 
+These steps describe the `Bash` frontend. The `PowerShell` tool has its own
+tokenizer, cmdlet table, and path resolution — backslash is a path character
+there, not an escape (see [The PowerShell tool](#the-powershell-tool)) — and
+rejoins this one at the classification steps (9–12), so both reach a decision
+through the same boundary rules and produce the same reasons. Symlink staging
+(step 7) has no PowerShell equivalent yet.
+
 1. **Tokenize** the command with Python's `shlex` (POSIX mode, punctuation
    grouping) so quotes are respected and shell operators (`|`, `&&`, `>`, `;`)
    become their own tokens. Heredoc body lines (everything between a `<<TAG`
@@ -427,7 +489,23 @@ After upgrading either way:
    the pattern does — which is already how a glob written straight into a file
    argument is treated, so `cat docs/*.md` and the loop over it now agree. A
    pattern that escapes (`../*.md`, `/etc/*.conf`) resolves outside and prompts
-   like any other outside path. Lists with a non-literal item (a `$`, command
+   like any other outside path.
+
+   A list item may also be built from an *enclosing* loop's variable, so nested
+   surveys resolve too: in `for d in docs/*; do for f in "$d"/*.md`, the inner
+   variable binds one candidate per (outer candidate, item) pair — here the
+   single pattern `docs/*/*.md`. That cross product is what bash actually
+   visits, and each pair keeps the segment structure of every path it expands
+   to, so the same reasoning applies at any nesting depth. An outside outer
+   candidate carries into every inner candidate built from it and prompts,
+   naming the resolved path. Two limits keep the work bounded as depth
+   multiplies: a variable is poisoned rather than bound when its candidate set
+   would exceed 256 values, and a file argument naming several loop variables
+   keeps its runtime-expanded prompt when their cross product would. Both
+   poison rather than truncate — a checked prefix would say nothing about the
+   candidates past it.
+
+   Lists with a non-literal item (a `$` the hook can't resolve, command
    substitution, or brace like `{a,b}` — brace-expanded by bash, so the literal
    string isn't a stand-in for the real paths), the `for VAR; do …` ("$@")
    form, the `for ((…))` arithmetic form, and a loop variable reassigned in the
@@ -469,11 +547,12 @@ After upgrading either way:
 8. **Resolve** every file argument against `$CLAUDE_PROJECT_DIR` with
    `realpath`, collapsing `../` and following symlinks. Anything that resolves
    outside the root yields `ask`; otherwise `allow`. A leading `~` or `~/…` is
-   expanded to `$HOME` first (bash does this deterministically), so a home path
-   inside the root is allowed instead of needlessly prompted. Tokens that bash
-   would still expand unpredictably at runtime — `~user`/`~+`/`~-`, an unset
-   `$HOME`, or a `$` that introduces an expansion (`$VAR`, `${VAR}`, `$(...)`,
-   `$1`, `$?`) — short-circuit to
+   expanded to your home directory first (bash does this deterministically), so
+   a home path inside the root is allowed instead of needlessly prompted. The
+   home comes from the same lookup Claude Code itself uses, not from `$HOME`,
+   which is unset on Windows. Tokens that bash would still expand unpredictably
+   at runtime — `~user`/`~+`/`~-`, or a `$` that introduces an expansion
+   (`$VAR`, `${VAR}`, `$(...)`, `$1`, `$?`) — short-circuit to
    `ask`, since `realpath` would otherwise lexically place them inside `cwd`.
    The two whitelisted pure substitutions from step 6
    (`$(git rev-parse --show-toplevel)`, `$(pwd)`) are the exception: when one
@@ -485,6 +564,12 @@ After upgrading either way:
    the `ask`.
    A `$` bash keeps literal — trailing (`foo$`) or before a non-name char
    (`a$.b`) — is treated as part of the filename and resolved normally.
+   On Windows a leading-slash path is read through Git Bash's mount table
+   before `realpath`, since that is what the shell will do with it: `/c/…` is
+   the C: drive, `/tmp` is `%TMP%`, `/bin` is `<git>\usr\bin`, and anything
+   else sits under the Git install dir. Without it the guard named a directory
+   on whichever drive happened to be current. The native `Read`/`Edit` tools
+   are *not* the shell and keep the drive-relative reading they themselves use.
    Well-known
    device paths (`/dev/null`, `/dev/stdin`, `/dev/stdout`, `/dev/stderr`,
    `/dev/zero`, `/dev/tty`, `/dev/random`, `/dev/urandom`, `/dev/fd/N`) are
@@ -532,8 +617,11 @@ After upgrading either way:
    [Configuration](#configuration).
 11. **Deny** host-wide temp. After the steps above, any *remaining*
    outside-workspace file argument whose resolved `realpath` is at or under a
-   host-temp root (`/tmp`, `/var/tmp`, `$TMPDIR`, all resolved first — so macOS's
-   `/tmp → /private/tmp` and a `$TMPDIR` under `/var/folders/…` are caught) is
+   host-temp root (`/tmp`, `/var/tmp`, `$TMPDIR`, and the platform's own temp
+   dir — `%TMP%` on Windows, which the POSIX names don't cover — all resolved
+   first, so macOS's `/tmp → /private/tmp` and a `$TMPDIR` under
+   `/var/folders/…` are caught; on Windows a command's own `/tmp/x` resolves to
+   `%TMP%` too, so it lands on the same root) is
    reclassified from `ask` to `deny`, with a message steering to a repo-local
    gitignored scratch dir. Because this runs on the already-resolved file
    arguments, a `/tmp` that appears only as text (a grep pattern, an `echo`
@@ -561,7 +649,12 @@ After upgrading either way:
    invisible. The hook scans the *raw* command for substitution bodies in
    unquoted or double-quoted context (single-quoted `'$(…)'` is a bash literal
    and is skipped; `$((…))` arithmetic has no command) and runs each body back
-   through steps 1–13. Only *offenders* bubble up: a clean guarded command inside
+   through steps 1–13. Heredoc bodies leave the command line first and are
+   scanned on their own: a quoted-delimiter body is literal to bash and is
+   dropped, an unquoted one is scanned with quoting turned off, because bash
+   applies none inside it — so the apostrophe in a `don't` there is text, not
+   the start of a quoted run that would hide a live `$(…)` after it. Only
+   *offenders* bubble up: a clean guarded command inside
    a substitution never turns a deferring outer command into an `allow` — this
    step can only add friction. (The bare unquoted `$(…)` form was already caught,
    because its `(`/`)` split the inner command into its own group.)
@@ -597,12 +690,13 @@ flowing, avoid triggering it:
   outside the root (including via `../` traversal) prompts every time.
 - **Don't put `$VAR`, `$(...)`, or a `~user` prefix in a guarded file argument.**
   The hook can't expand them, so it treats them as outside the root and prompts —
-  even when they'd resolve in-root. (A bare `~`/`~/…` *is* expanded to `$HOME`,
-  so home-relative paths inside the root are fine. A variable assigned a plain
-  literal path *earlier in the same command string* — `f=./config/app.json; cat $f`
+  even when they'd resolve in-root. (A bare `~`/`~/…` *is* expanded to your home
+  directory, so home-relative paths inside the root are fine. A variable assigned
+  a plain literal path *earlier in the same command string* — `f=./config/app.json; cat $f`
   — is also resolved and doesn't prompt, as is a `for f in a b c` loop over a
-  literal list, or a `for f in docs/*.md` loop over an in-root glob, when its
-  body is on its own line after `do`. A file operand or
+  literal list, a `for f in docs/*.md` loop over an in-root glob, and a nested
+  loop whose inner list is built from the outer variable
+  (`for d in docs/*; do for f in "$d"/*.md`). A file operand or
   redirect target that *begins* with `$(git rev-parse --show-toplevel)` or
   `$(pwd)` — the same two whitelisted substitutions the `cd` tracker resolves —
   is resolved too, so `cp x "$(git rev-parse --show-toplevel)/backup/"` is fine.)
@@ -620,7 +714,8 @@ flowing, avoid triggering it:
   prompts, not lost tracking. Stay inside the root unless you mean to work
   outside it.
 - **Write temp files inside the project root, not `/tmp`.** Host-wide temp
-  (`/tmp`, `/var/tmp`, `$TMPDIR`) is **denied** by default — not just prompted —
+  (`/tmp`, `/var/tmp`, `$TMPDIR`, and `%TMP%` on Windows) is **denied** by
+  default — not just prompted —
   because it's shared across sessions and worktrees and lives outside the root.
   Use a repo-local gitignored scratch dir like `./tmp/out.txt` instead. (Redirects
   and command output to `/dev/null`, `/dev/stdout`, `/dev/stderr`, and `/dev/fd/N`
@@ -635,7 +730,9 @@ flowing, avoid triggering it:
   `~/.cache/pip`, cargo's `~/.cargo/registry`) are outside the project root, so
   every guarded read of them prompts. Vendor the source into the tree instead
   (e.g. `go mod vendor` → `vendor/`, npm's `node_modules/`) and read from there,
-  or use the Read/Grep tools, which skip the hook entirely.
+  or use the Read/Grep tools, whose literal single-path inputs avoid the
+  `$VAR`/`$(...)` false positives — they are still guarded, so a read that
+  genuinely lands outside the root still prompts.
 - **In a git worktree, edit only via this session's checkout — never another
   checkout's path.** A write (bash or `Edit`/`Write`) into the primary checkout
   or another worktree of the same repo is **denied**: it would land your change
@@ -678,8 +775,8 @@ variables tune this — all read at hook time, so no restart is needed:
 | --- | --- | --- |
 | `WORKSPACE_GUARD_TMP_ACTION` | `deny` | `deny` blocks host-temp paths; `ask` softens to a confirmation prompt. Any other value falls back to `deny`. |
 | `WORKSPACE_GUARD_SCRATCH_DIR` | `tmp/` | The repo-local scratch dir named in the deny message. |
-| `WORKSPACE_GUARD_TMP_ROOTS` | (empty) | Extra host-temp roots, `:`- or `,`-separated. **Additive** — it extends the built-in `/tmp`, `/var/tmp`, and `$TMPDIR`; it can't shrink them. |
-| `WORKSPACE_GUARD_TMP_ALLOW` | (empty) | Allowlist of exact-prefix or glob paths (`:`/`,`-separated) that **escape** the deny — for the rare tool that genuinely needs `/tmp`. |
+| `WORKSPACE_GUARD_TMP_ROOTS` | (empty) | Extra host-temp roots, separated by the platform list separator (`:` on POSIX, `;` on Windows) or a comma. **Additive** — it extends the built-in `/tmp`, `/var/tmp`, `$TMPDIR`, and the platform temp dir (`%TMP%` on Windows); it can't shrink them. |
+| `WORKSPACE_GUARD_TMP_ALLOW` | (empty) | Allowlist of exact-prefix or glob paths (same separators) that **escape** the deny — for the rare tool that genuinely needs `/tmp`. |
 
 `WORKSPACE_GUARD_TMP_ALLOW` is the one knob that *loosens* the guard, so it's
 empty by default and opt-in: an allowlisted host-temp path is allowed silently
@@ -702,11 +799,18 @@ sub-agent data). You can extend it with additional prefixes:
 
 | Env var | Default | Effect |
 | --- | --- | --- |
-| `WORKSPACE_GUARD_READ_ALLOW_PREFIXES` | (empty) | Extra read-exempt prefixes, `:`- or `,`-separated. **Additive** — it extends the built-in list. |
+| `WORKSPACE_GUARD_READ_ALLOW_PREFIXES` | (empty) | Extra read-exempt prefixes, separated by the platform list separator (`:` on POSIX, `;` on Windows) or a comma. **Additive** — it extends the built-in list. |
 
 Each entry is run through `realpath` so platform symlinks resolve correctly.
 Scope entries tightly: anything under a configured prefix is silently allowed
 for read commands without a confirmation prompt.
+
+A relative entry is resolved against the tool's working directory, the same base
+the command's own file arguments resolve against. On Windows an entry with a
+leading slash is first read the way Git Bash reads it, so `/c/Users/me/shared`
+means `C:\Users\me\shared` — as it does in a command — rather than a `c` folder
+on whichever drive is current. Both rules apply to every configured path: the
+host-temp roots and allowlist above, and these prefixes.
 
 ### Sibling-checkout (worktree) deny
 
@@ -737,9 +841,9 @@ final output.
 
 ## Limitations
 
-- A leading `~`/`~/…` is expanded to `$HOME` (bash does this deterministically),
-  so a home path inside the root is allowed. Tokens that bash would expand
-  *unpredictably* at runtime — `~user`/`~+`/`~-`, an unset `$HOME`, or a `$`
+- A leading `~`/`~/…` is expanded to your home directory (bash does this
+  deterministically), so a home path inside the root is allowed. Tokens that
+  bash would expand *unpredictably* at runtime — `~user`/`~+`/`~-`, or a `$`
   that introduces an expansion (`$VAR`, `${VAR}`, `$(...)`, `$1`, `$?`) — are
   still treated as outside-workspace. A `$` bash keeps literal (trailing, or
   before a non-name char like `.`/`/`) is part of the filename and resolved
@@ -752,20 +856,32 @@ final output.
   unterminated body swallows to the end of the command (matching bash). A `<<`
   inside quotes, inside a `#` comment, or produced by arithmetic (`$((x<<2))`,
   `((x<<2))`) is not a heredoc and never arms a delimiter. Command
-  substitutions *inside* a heredoc body are still analyzed even when a quoted
-  delimiter (`<<'EOF'`) would stop bash expanding them — a conservative extra
-  `ask`, never a missed one.
+  substitutions *inside* a heredoc body follow bash's own rule: a quoted
+  delimiter (`<<'EOF'`, `<<"EOF"`, `<<\EOF`, or any partly quoted word) makes
+  the body literal, so a `$(…)` there is documentation and is ignored; an
+  unquoted `<<EOF` body is expanded by bash and is still analyzed — on its own,
+  with quoting off, since a heredoc body has none.
 - Literal variable propagation is deliberately narrow. Only standalone
   `NAME=value` / `export NAME=value` assignments whose value is a plain
   literal after quote removal (non-empty; no `$`, backticks, glob characters,
   whitespace, or `:`) are propagated, and only into plain `$NAME`/`${NAME}`
-  uses. Parameter-expansion operators (`${f:-x}`, `${f%.*}`), arrays, values
+  uses. On Windows a leading drive prefix (`C:\`, `c:/`) is exempt from the `:`
+  rule — otherwise every absolute path there is impure and propagation never
+  fires; a second `:` anywhere in the value still rejects it, and on
+  Linux/macOS `C:/x` is just a directory named `C:` so the rule is unchanged.
+  Parameter-expansion operators (`${f:-x}`, `${f%.*}`), arrays, values
   built from other expansions, and variables later touched by
   `read`/`eval`/`declare`/`unset` or assigned inside a subshell,
   pipeline segment, or backgrounded command all keep the runtime-expanded
-  `ask`. A heredoc (`<<`) anywhere in the command or an in-command `IFS=`
-  reassignment disables propagation for that command entirely (conservative —
-  a heredoc adds redirection state, and a changed `IFS` alters word splitting).
+  `ask`. A heredoc (`<<`) anywhere in the command, or anything that may set
+  `IFS`, disables propagation for that command entirely (conservative — a
+  heredoc adds redirection state, and a changed `IFS` re-splits every later
+  expansion, so a value checked as one word can reach the command as several).
+  Setting `IFS` counts whether it is a plain `IFS=`/`export IFS=` assignment,
+  an assigning builtin naming it (`declare`, `local`, `typeset`, `readonly`,
+  `read`, `printf -v`, `for IFS in …`), or an `eval`/`source` that could set it
+  out of sight. Only `unset IFS` is exempt: bash falls back to the default
+  splitting the guard already assumes.
   Uncertainty always falls back to `ask` — propagation only ever adds allows for
   expansions bash performs deterministically.
 - `for VAR in <list>` loop resolution is equally narrow. The candidate set is
@@ -783,11 +899,22 @@ final output.
   through a *matched* name that is itself a symlink out of the workspace, since
   the pattern is resolved instead of the files: `for f in docs/*.md; do cat
   "$f"; done` treats a `docs/link.md` → `/etc/passwd` symlink the same way
-  `cat docs/*.md` already does. `shopt -s globstar` makes `**` match extra path
-  segments the pattern doesn't show, which can only make a trailing `../` in the
-  loop body climb higher than bash will — an extra prompt, never a missed one.
-  A *nested* loop over a glob built from an outer loop variable (`for f in
-  "$d"/*.md`) still holds a `$`, so it keeps today's poison.
+  `cat docs/*.md` already does. Under `shopt -s globstar` a `**` matches a
+  *variable* number of path segments, including zero — `docs/**` expands to
+  `docs/` as well as `docs/sub/b.md` — so a trailing `../` in the loop body can
+  climb one level higher at runtime than the pattern shows, and a read just
+  outside the root can be allowed. Globstar is off by default in bash; with it
+  on, prefer an explicit pattern over `**` in a loop list.
+- A nested loop's list may be built from the outer loop's variable
+  (`for d in docs/*; do for f in "$d"/*.md`), and the inner variable binds the
+  cross product. A candidate set larger than 256 values poisons the variable
+  instead, so a loop over very long literal lists keeps today's prompt. The
+  same 256 cap applies to a file argument that names several loop variables at
+  once: under three nested loops of 256 literals, `cat $a/$b/$c` stands for
+  16.7 million paths, so it keeps the runtime-expanded prompt rather than being
+  enumerated. Enumerating it ran the hook past two minutes — and because Claude
+  Code treats a failed `PreToolUse` hook as a non-blocking error, a guard that
+  never answers enforces nothing at all.
 - `realpath` only follows symlinks for files that already exist; nonexistent
   paths are normalized lexically (fine for read-style commands).
 - Redirect targets (`> file`) are inspected on *every* command, guarded or not —
@@ -851,8 +978,8 @@ final output.
   relative paths against the command's starting cwd, not a cwd set by an earlier
   in-chain `cd` (`cd /x && echo "$(cat f)"` judges `f` against the start cwd); a
   body that itself contains a quoted operator character (`echo "$(grep ")" f)"`)
-  can mis-tokenize on re-parse and defer; and backtick nesting via `` \` `` or a
-  no-space `$((…))`-shaped subshell isn't decoded. Process substitution
+  can mis-tokenize on re-parse and defer; and backtick nesting via
+  `` \` `` or a no-space `$((…))`-shaped subshell isn't decoded. Process substitution
   `<(…)`/`>(…)` is only ever unquoted and is already caught by the subshell
   split.
 - The sibling-checkout `deny` classifies *write-context* file arguments — the
@@ -871,6 +998,35 @@ final output.
   (fail-safe: the deny is never applied on uncertainty, so the boundary is never
   weakened). A main-checkout session is a deliberate no-op even when worktrees
   exist.
+- **The PowerShell tool is guarded for a known set of cmdlets, and only those.**
+  Claude Code ships two shell tools. Which one a Windows session gets depends on
+  whether Git for Windows is installed — without it there is no Bash tool and
+  shell commands run through PowerShell, as they also do wherever
+  `CLAUDE_CODE_USE_POWERSHELL_TOOL=1` is set. Both are hooked. PowerShell is not
+  a POSIX shell, though, so it gets its own parser and its own table rather than
+  the bash one — see [The PowerShell tool](#the-powershell-tool): `Get-Content`,
+  `Select-String`, `Import-Csv`, `Import-Clixml`, `Set-Content`, `Add-Content`,
+  `Out-File`, `Tee-Object`, `Export-Csv`, `Export-Clixml`, `Copy-Item`,
+  `Move-Item`, `Remove-Item`, `Rename-Item`, their aliases (`cat`, `type`, `gc`,
+  `sls`, `sc`, `ac`, `cp`, `mv`, `rm`, `del`, …), and output redirects.
+  Everything else — a cmdlet not on that list, a .NET call such as
+  `[IO.File]::ReadAllText(…)`, a native `.exe` — is **not checked**, and the
+  session gets no signal that it wasn't. The alternative was to prompt on
+  everything unparsed, which at this table size would prompt on nearly every
+  command; a guard that noisy gets switched off, and zero coverage is worse than
+  partial. Expect this list to grow. The native file tools (`Read`, `Grep`,
+  `Glob`, `Edit`, `Write`) are guarded in full either way.
+- **A custom Git Bash mount is read as an ordinary directory.** On Windows the
+  hook resolves a leading-slash path through the mount table Git for Windows
+  ships (`/c/…` is the C: drive, `/tmp` is `%TMP%`, `/bin` is `<git>\usr\bin`,
+  anything else hangs off the Git install dir). A mount you added in
+  `/etc/fstab`, and MSYS's virtual paths like `/proc`, are not in that table and
+  fall through to the last rule, so the prompt names a path under the Git
+  install dir instead. The same happens for every non-drive path if Git Bash
+  can't be located at all (the hook looks at `CLAUDE_CODE_GIT_BASH_PATH`, then
+  `bash` and `git` on `PATH`) — it keeps the older drive-relative reading
+  rather than guessing. Either way the effect is a prompt naming a path that
+  isn't quite the one being opened, never a missed one.
 
 ## Companion plugin: branch-guard
 

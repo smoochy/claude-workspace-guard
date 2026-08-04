@@ -4,7 +4,7 @@ outside the workspace; allow when it only touches workspace files or pipes.
 
 Reads the hook JSON on stdin, emits a PreToolUse decision on stdout.
 """
-import sys, os, json, re, shlex, fnmatch, collections, tempfile
+import sys, os, json, re, shlex, shutil, fnmatch, collections, tempfile
 
 # POSIX command-prefix assignment: NAME starts with letter/underscore,
 # followed by letters/digits/underscores, then `=`. Anything after the `=`
@@ -36,13 +36,29 @@ ASSIGNISH_RE = re.compile(r'^([A-Za-z_][A-Za-z0-9_]*)(\+?=|\[|\+\+|--)')
 # AFTER shlex quote removal: expansions (`$`, backticks), glob metachars
 # (`*?[` — an unquoted use of the variable would glob), and word-splitting
 # chars (whitespace for the default IFS; `:` so a PATH-style value can't be
-# split by an exotic inherited IFS into pieces the single-token check misses).
+# split by an IFS the hook didn't see into pieces the single-token check misses).
 IMPURE_VALUE_CHARS = frozenset(' \t\n$`*?[:')
 
 # The same test minus the glob metachars, for `for VAR in <list>` items only: a
 # pattern there is its own proxy for the paths it expands to (see
 # `literal_for_item`).
 IMPURE_ITEM_CHARS = IMPURE_VALUE_CHARS - frozenset('*?[')
+
+# The one `:` that isn't a PATH-style separator: a Windows drive prefix (Q48).
+# Without an exemption every Windows absolute path is impure, so propagation is
+# dead on the platform — including the `~/` form, whose expansion carries the
+# drive letter. The separator must follow the colon because bash tilde-expands
+# after a `:` in an assignment RHS (`f=C:~/x` -> `C:/Users/…`), which the
+# leading-`~` rule in literal_assignment_value doesn't model.
+DRIVE_PREFIX_RE = re.compile(r'^[A-Za-z]:[\\/]')
+
+# ...and the exemption applies only where os.path resolves a drive. On POSIX
+# `C:/x` is a relative directory literally named `C:`, so exempting it there
+# would give up the PATH-style protection for nothing. splitdrive is the
+# discriminator rather than os.name for the reason claude_tmp_root() uses
+# hasattr: honouring the drive is the actual condition — it is what realpath and
+# isabs downstream will do with the value.
+DRIVE_PATHS = bool(os.path.splitdrive('C:/x')[0])
 
 # Names bash treats specially — assigning them does not make `$NAME` expand
 # to the assigned literal (dynamic values, readonly, or reset by the shell).
@@ -165,17 +181,146 @@ def is_allowed_device(path):
     return False
 
 
+# --- Git Bash (MSYS) path forms ----------------------------------------------
+# On native Windows the Bash tool is Git Bash, which resolves a leading-slash
+# path through the MSYS mount table. The hook is a native Python process, where
+# the same string is drive-relative — so the two disagree, and the guard named
+# `D:\etc\passwd` in a prompt for a command that reads `C:\Program Files\Git\
+# etc\passwd`, while MSYS-form configuration entries matched nothing at all
+# (Q52). These rules are the table Git for Windows ships, read off a
+# windows-latest runner (Git 2.55, MSYSTEM=MINGW64):
+#
+#     C:/Program Files/Git          on /
+#     C:/Program Files/Git/usr/bin  on /bin
+#     <%TMP%>                       on /tmp   (usertemp)
+#     C: on /c, D: on /d, ...                 (cygdrive prefix `/`)
+#
+# The drive rule is generic rather than per-existing-drive: `/x/y` becomes
+# `X:\y` on a machine with no X: drive, which is what Git Bash does too.
+#
+# A user-edited /etc/fstab can add mounts the hook can't see, and MSYS's virtual
+# paths (`/proc`) have no native form. Both fall through to the `/` rule, which
+# leaves the failure direction where it already was — an outside-workspace
+# prompt naming a path that isn't quite right, never a silent allow.
+MSYS_DRIVE_RE = re.compile(r'^/([A-Za-z])(?:/(.*))?$')
+
+# Relative path of the MSYS bash inside its own root, used to confirm a
+# candidate root actually is one. `bin/bash.exe` is a wrapper Git for Windows
+# adds; `usr/bin/bash.exe` is the MSYS bash itself and is what marks the root.
+_MSYS_ROOT_MARKER = os.path.join('usr', 'bin', 'bash.exe')
+
+_msys_root_cached = ()          # () = not yet computed (None is a real answer)
+
+
+def msys_root():
+    """Native path of Git Bash's ``/``, or None when no Git Bash is found.
+
+    Located from the bash Claude Code runs: ``CLAUDE_CODE_GIT_BASH_PATH`` when
+    set (it names that bash exactly), else ``bash``/``git`` on PATH. Each
+    candidate's ancestors are walked until one holds ``usr/bin/bash.exe``, which
+    both finds the root from any depth (``bin/bash.exe``, ``usr/bin/bash.exe``,
+    ``cmd/git.exe`` all land on it) and rejects a false positive — on a machine
+    without Git for Windows, ``bash`` on PATH is the WSL launcher in
+    ``C:\\Windows\\System32``, whose ancestors carry no such marker. Returning
+    None there is the point: the guard keeps its old drive-relative reading
+    rather than inventing a root.
+
+    Cached for the life of the process — the PATH scan is a few dozen stats,
+    and it only runs when a command actually names a non-drive MSYS path.
+    """
+    global _msys_root_cached
+    if _msys_root_cached != ():
+        return _msys_root_cached
+    _msys_root_cached = None
+    cands = [os.environ.get('CLAUDE_CODE_GIT_BASH_PATH'),
+             shutil.which('bash'), shutil.which('git')]
+    for exe in cands:
+        if not exe:
+            continue
+        d = os.path.dirname(os.path.abspath(exe))
+        while True:
+            try:
+                if os.path.isfile(os.path.join(d, _MSYS_ROOT_MARKER)):
+                    _msys_root_cached = d
+                    return d
+            except OSError:
+                break
+            parent = os.path.dirname(d)
+            if parent == d:
+                break
+            d = parent
+    return None
+
+
+def msys_tmp():
+    """Native path of Git Bash's ``/tmp`` — the ``usertemp`` mount, ``%TMP%``.
+
+    Realpath'd, because ``%TMP%`` commonly arrives in 8.3 short form
+    (``C:\\Users\\RUNNER~1\\AppData\\Local\\Temp``) while the file argument it
+    has to compare against is realpath'd to the long form. The exact-prefix
+    allowlist branch would survive that (it realpaths too), but the glob branch
+    only normalizes — so a short name there exempted nothing at all.
+    """
+    return os.path.realpath(tempfile.gettempdir())
+
+
+def msys_to_native(raw):
+    """Rewrite a leading-slash Git Bash path into the native path it names.
+
+    Returns ``raw`` unchanged on POSIX (where the string already means what it
+    says), for anything that isn't a leading-slash path, and for a non-drive
+    path when :func:`msys_root` finds no Git Bash.
+
+    The result keeps forward slashes and is deliberately left un-normalized:
+    ntpath reads either separator, and every caller hands the value to
+    ``realpath``, which resolves ``..`` through symlinks rather than lexically.
+    """
+    if not DRIVE_PATHS or not raw.startswith('/'):
+        return raw
+    m = MSYS_DRIVE_RE.match(raw)
+    if m:
+        return m.group(1).upper() + ':/' + (m.group(2) or '')
+    if raw == '/tmp' or raw.startswith('/tmp/'):
+        return msys_tmp().rstrip('/\\') + raw[len('/tmp'):]
+    root = msys_root()
+    if root is None:
+        return raw
+    root = root.rstrip('/\\')
+    if raw == '/bin' or raw.startswith('/bin/'):
+        return root + '/usr/bin' + raw[len('/bin'):]
+    return root + raw
+
+
+def resolved_home():
+    """Absolute path of the current user's home directory, or None.
+
+    Resolved with ``expanduser`` rather than ``$HOME`` because the hook is
+    launched through ``run-python-hook.cmd``, so on Windows it inherits a
+    cmd.exe environment where ``HOME`` is unset (Q40, Q43). ``expanduser``
+    reads ``USERPROFILE`` (then ``HOMEDRIVE``/``HOMEPATH``) there, matching the
+    ``os.homedir()`` that Claude Code uses to pick where to write, and on POSIX
+    falls back to the pwd database when ``HOME`` is unset. It returns ``~``
+    unchanged when nothing resolves, hence the isabs check.
+    """
+    home = os.path.expanduser('~')
+    return home if os.path.isabs(home) else None
+
+
 def claude_projects_dir():
     """Realpath of Claude Code's per-user project-data dir, ``~/.claude/projects/``.
 
     Claude Code writes session and sub-agent data (workflow journals, task
     output indices, etc.) under this directory. Reading these files back is
     not the boundary this hook guards: the data is written by the harness
-    itself, not by external inputs. Returns None if $HOME is unset or the
+    itself, not by external inputs. Returns None if the home directory or the
     path cannot be resolved.
+
+    Without a home directory the prefix would vanish and every read of Claude's
+    own session data would prompt (Q40), so it resolves via
+    :func:`resolved_home` rather than ``$HOME``.
     """
-    home = os.environ.get('HOME')
-    if not home:
+    home = resolved_home()
+    if home is None:
         return None
     try:
         return os.path.realpath(os.path.join(home, '.claude', 'projects'))
@@ -183,16 +328,18 @@ def claude_projects_dir():
         return None
 
 
-def allowed_read_prefixes():
+def allowed_read_prefixes(base):
     """Resolved list of absolute path prefixes exempt from the workspace check
     for **read-only** guarded commands (see WRITE_COMMANDS for exclusions).
 
     Default: Claude Code's per-user project-data dir (~/.claude/projects/).
-    Additive extension via WORKSPACE_GUARD_READ_ALLOW_PREFIXES (colon- or
-    comma-separated). Each entry is run through realpath so platform symlinks
-    (e.g. /tmp -> /private/tmp on macOS) resolve correctly. Entries that
-    cannot be resolved are skipped (fail-open on config, fail-safe on the
-    boundary: a bad entry just loses its exemption).
+    Additive extension via WORKSPACE_GUARD_READ_ALLOW_PREFIXES (split on
+    ``os.pathsep`` or a comma). Each entry goes through :func:`resolve_from`
+    against ``base`` (the tool's cwd) so platform symlinks (e.g. /tmp ->
+    /private/tmp on macOS) resolve correctly and a drive-relative Windows entry
+    lands on the drive its file arguments do. Entries that cannot be resolved
+    are skipped (fail-open on config, fail-safe on the boundary: a bad entry
+    just loses its exemption).
     """
     defaults = []
     cpd = claude_projects_dir()
@@ -201,10 +348,9 @@ def allowed_read_prefixes():
     extras = _split_pathlist(os.environ.get('WORKSPACE_GUARD_READ_ALLOW_PREFIXES', ''))
     out = []
     for p in defaults + extras:
-        try:
-            out.append(os.path.realpath(p))
-        except OSError:
-            continue
+        rp = resolve_from(base, p)
+        if rp is not None:
+            out.append(rp)
     return out
 
 
@@ -301,7 +447,9 @@ def path_at_or_under(rp, root):
 # every session/process and every worktree, colliding between concurrent runs
 # and living outside the project root. Such a path gets a stronger, constructive
 # `deny` (steering to a repo-local gitignored scratch dir) instead of the usual
-# outside-workspace `ask`. The list is extensible; see host_temp_roots().
+# outside-workspace `ask`. These are the POSIX names; the platform's own temp
+# dir is added by host_temp_roots(), which is what covers Windows. The list is
+# extensible; see host_temp_roots().
 HOST_TEMP_DEFAULT_ROOTS = ('/tmp', '/var/tmp')
 
 
@@ -317,28 +465,83 @@ def _split_pathlist(raw):
     return parts
 
 
-def host_temp_roots():
+def resolve_from(base, raw):
+    """Realpath ``raw``, resolving a non-absolute path against ``base``.
+
+    Every configured path — a host-temp root, an allowlist entry, a read-allow
+    prefix — is ultimately compared against a file argument, and file arguments
+    resolve against the tool's cwd. Both sides must therefore be interpreted
+    under the same rule.
+
+    On POSIX ``/tmp`` is absolute, so ``base`` never changes the answer and this
+    is exactly the old ``realpath``. On Windows it is not: a leading slash names
+    a directory on *whichever drive is current*, and ``os.path.isabs`` reports
+    False for it. Resolving such a root from the hook process's own cwd put it
+    on a different drive than the file arguments, so the comparison silently
+    never matched — a host-temp ``deny`` degraded to a plain ``ask``, and a
+    configured allowlist entry stopped matching anything at all.
+
+    A leading-slash entry is first read as Git Bash reads it (see
+    :func:`msys_to_native`), so `/c/Users/me/shared` names the directory the
+    user meant rather than a `c` folder on whichever drive is current.
+
+    Returns None when the path can't be resolved (callers skip it: fail-open on
+    config, fail-safe on the boundary)."""
+    return _resolve_literal(base, msys_to_native(raw))
+
+
+def _resolve_literal(base, raw):
+    """:func:`resolve_from` without the MSYS reading — the raw string taken at
+    face value. Only ``host_temp_roots`` wants this, to keep both readings."""
+    if raw and not os.path.isabs(raw):
+        raw = os.path.join(base, raw)
+    try:
+        return os.path.realpath(raw)
+    except OSError:
+        return None
+
+
+def host_temp_roots(base):
     """Resolved set of host-temp roots: the defaults, any extra roots from
     ``WORKSPACE_GUARD_TMP_ROOTS`` (additive — never replaces the defaults, so the
-    boundary can't be weakened by clearing it), and ``$TMPDIR`` if set.
+    boundary can't be weakened by clearing it), ``$TMPDIR`` if set, and on
+    Windows the platform temp dir the POSIX names don't cover.
 
-    Each root is run through ``realpath`` so a path under macOS's
-    ``/tmp -> /private/tmp`` symlink or a ``$TMPDIR`` under ``/var/folders/...``
-    is matched after the file argument is itself resolved. A root that can't be
-    resolved is skipped (fail-open)."""
+    Each root goes through :func:`resolve_from` against ``base`` (the tool's
+    cwd), so a path under macOS's ``/tmp -> /private/tmp`` symlink or a
+    ``$TMPDIR`` under ``/var/folders/...`` is matched after the file argument is
+    itself resolved, and a drive-relative Windows root lands on the same drive
+    the file arguments do. A root that can't be resolved is skipped
+    (fail-open).
+
+    A leading-slash root is added under BOTH readings: what Git Bash makes of it
+    (``/tmp`` -> ``%TMP%``, the reading that matches a command's own arguments)
+    and the drive-relative one it had before Q52 (``<drive>\\tmp``). An extra
+    root only ever widens a ``deny`` tier, so keeping the second costs nothing
+    and can't be a regression for whoever relied on it."""
     raw = list(HOST_TEMP_DEFAULT_ROOTS)
     raw += _split_pathlist(os.environ.get('WORKSPACE_GUARD_TMP_ROOTS', ''))
     tmpdir = os.environ.get('TMPDIR')
     if tmpdir:
         raw.append(tmpdir)
+    # Windows has no $TMPDIR, and its host-wide temp dir is %TMP%/%TEMP% —
+    # which the POSIX names above miss entirely, so a scratch write to the one
+    # directory this tier exists to catch got a plain `ask` instead of the
+    # steered `deny`. tempfile.gettempdir() is where that lands. Gated on the
+    # same discriminator as claude_tmp_root() (which already pays for the call
+    # there): the missing $TMPDIR is the actual condition, and on POSIX
+    # gettempdir() would only re-derive $TMPDIR-or-/tmp while adding its probe
+    # to every Bash call.
+    if not hasattr(os, 'getuid'):
+        raw.append(tempfile.gettempdir())
     out = set()
     for r in raw:
         if not r:
             continue
-        try:
-            out.add(os.path.realpath(r))
-        except OSError:
-            continue
+        for cand in (msys_to_native(r), r):
+            rp = _resolve_literal(base, cand)
+            if rp is not None:
+                out.add(rp)
     return out
 
 
@@ -364,11 +567,18 @@ def host_temp_allowlist():
     return _split_pathlist(os.environ.get('WORKSPACE_GUARD_TMP_ALLOW', ''))
 
 
-def matches_allowlist(rp, patterns):
+def matches_allowlist(rp, patterns, base):
     """True when resolved path ``rp`` matches an allowlist entry. An entry with
     glob metacharacters is matched with ``fnmatch``; otherwise it's an exact or
-    directory-prefix match, resolved with ``realpath`` first so a configured
-    ``/tmp/ok`` matches the realpath ``/private/tmp/ok`` on macOS.
+    directory-prefix match, resolved first so a configured ``/tmp/ok`` matches
+    the realpath ``/private/tmp/ok`` on macOS.
+
+    Both forms are normalized against ``base`` (the tool's cwd) for the reason
+    in :func:`resolve_from` — otherwise a Windows entry written ``/tmp/ok``
+    resolves on a different drive than the path it is meant to exempt and the
+    knob silently does nothing. The glob form is normalized rather than
+    realpath'd so its metacharacters survive, and takes its own
+    :func:`msys_to_native` pass for the same reason ``resolve_from`` does.
 
     Matching is tried against ``rp`` and, on macOS, against ``rp`` with the
     leading ``/private`` stripped — so a user-written glob like ``/tmp/build-*``
@@ -381,15 +591,14 @@ def matches_allowlist(rp, patterns):
         if not p:
             continue
         if any(c in p for c in '*?['):
-            if any(fnmatch.fnmatch(c, p) for c in cands):
+            pat = msys_to_native(p)
+            pat = pat if os.path.isabs(pat) else os.path.join(base, pat)
+            if any(fnmatch.fnmatch(c, os.path.normpath(pat)) for c in cands):
                 return True
             continue
-        try:
-            rp_pat = os.path.realpath(p)
-        except OSError:
-            rp_pat = p
-        base = rp_pat.rstrip(os.sep)
-        if any(c == rp_pat or path_at_or_under(c, base) for c in cands):
+        rp_pat = resolve_from(base, p) or p
+        stem = rp_pat.rstrip(os.sep)
+        if any(c == rp_pat or path_at_or_under(c, stem) for c in cands):
             return True
     return False
 
@@ -847,7 +1056,7 @@ def _consume_heredoc_body(text, i, delim, strip_tabs):
     return n
 
 
-def strip_heredoc_bodies(cmd):
+def strip_heredoc_bodies(cmd, expanded=None):
     """Remove heredoc body text from the raw command string, before shlex.
 
     Bash slurps everything between the newline after a `<<WORD` / `<<-WORD`
@@ -873,6 +1082,17 @@ def strip_heredoc_bodies(cmd):
     not a redirection, so they never arm a bogus delimiter. `<<<` here-strings
     are a distinct operator and never match. A `<<` with no delimiter word arms
     nothing; an unterminated body swallows to end-of-input, both matching bash.
+
+    Every body is dropped either way; pass a list as ``expanded`` to also
+    collect, in order, the raw text of the ones whose delimiter carries no
+    quote and no backslash (`` <<EOF ``, not `` <<'EOF' ``). That is bash's own
+    expansion rule — a quoted delimiter makes the body literal, an unquoted one
+    leaves `$(…)` live — so the command-substitution scan in ``analyze_command``
+    sees exactly the bodies bash would evaluate (Q35). They come back separately
+    rather than left in the returned string because a body is data, not syntax:
+    inline, the apostrophe in a `don't` would open a quote for the rest of the
+    scan and hide a live `$(…)` after it, in that body or on a later command
+    line (Q50).
     """
     out = []
     i, n = 0, len(cmd)
@@ -925,15 +1145,18 @@ def strip_heredoc_bodies(cmd):
             while i < n and cmd[i] in ' \t':      # optional space before delim
                 out.append(cmd[i]); i += 1
             delim_chars = []
+            quoted = False                        # any quoting -> literal body
             while i < n and cmd[i] not in ' \t\n;|&()<>':
                 d = cmd[i]
                 if d == "'":
+                    quoted = True
                     out.append(d); i += 1
                     while i < n and cmd[i] != "'":
                         delim_chars.append(cmd[i]); out.append(cmd[i]); i += 1
                     if i < n:
                         out.append(cmd[i]); i += 1
                 elif d == '"':
+                    quoted = True
                     out.append(d); i += 1
                     while i < n and cmd[i] != '"':
                         if cmd[i] == '\\' and i + 1 < n:
@@ -944,20 +1167,24 @@ def strip_heredoc_bodies(cmd):
                     if i < n:
                         out.append(cmd[i]); i += 1
                 elif d == '\\' and i + 1 < n:
+                    quoted = True
                     delim_chars.append(cmd[i+1])
                     out.append(d); out.append(cmd[i+1]); i += 2
                 else:
                     delim_chars.append(d); out.append(d); i += 1
             delim = ''.join(delim_chars)
             if delim:
-                pending.append((delim, strip_tabs))
+                pending.append((delim, strip_tabs, quoted))
             last = 'x'
             continue
         if c == '\n':
             out.append('\n'); last = '\n'; i += 1
             while pending and i < n:
-                delim, strip_tabs = pending.pop(0)
-                i = _consume_heredoc_body(cmd, i, delim, strip_tabs)
+                delim, strip_tabs, quoted = pending.pop(0)
+                end = _consume_heredoc_body(cmd, i, delim, strip_tabs)
+                if expanded is not None and not quoted:
+                    expanded.append(cmd[i:end])
+                i = end
             continue
         out.append(c); last = c; i += 1
     return ''.join(out)
@@ -988,6 +1215,17 @@ def glue_dollar_paren(tokens):
 # aren't analyzed — a possible missed offender, never a fabricated one or a
 # silent allow.
 MAX_SUBST_DEPTH = 25
+
+# Maximum candidates the loop-variable expansion will ever materialise — both
+# the values a single loop variable may be bound to and the cross product a
+# token using several of them stands for. A token naming k loop variables
+# expands to the product of their candidate counts, so three nested `for`s over
+# 256 literals each make `cat $a/$b/$c` 16.7M paths to realpath: the hook ran
+# past two minutes, and a hook that doesn't answer is a non-blocking error, so
+# the guard enforces nothing at all. Over-cap POISONS (the variable drops, the
+# token stays runtime-expanded -> `ask`); it never truncates, which would check
+# a prefix of the candidates and silently allow the rest.
+MAX_LOOP_CANDIDATES = 256
 
 
 def _skip_balanced_parens(text, start):
@@ -1079,7 +1317,7 @@ def _scan_backticks(text, start):
     return (None, start)
 
 
-def command_substitutions(text):
+def command_substitutions(text, quotes=True):
     """Extract the command-substitution bodies bash would evaluate in ``text``.
 
     Returns the inner command string of each ``$(…)`` and backtick ``` `…` ```
@@ -1095,6 +1333,13 @@ def command_substitutions(text):
     caller recurses). A substitution with no balanced terminator before
     end-of-input contributes nothing (fail-safe: a possible missed offender,
     never a fabricated one).
+
+    With ``quotes=False`` a ``'`` or ``"`` is ordinary text and every
+    substitution is live. That is how bash reads an unquoted heredoc body —
+    quoting does not apply inside one — so the apostrophe in a `don't` must not
+    switch the scanner off for the rest of the body (Q50). Backslash still
+    escapes the next character, matching the body's own rule that a backslash
+    quotes a following `$`, backtick, backslash, or newline.
     """
     bodies = []
     i, n = 0, len(text)
@@ -1109,11 +1354,11 @@ def command_substitutions(text):
         if c == '\\':                              # escapes next char (not in '')
             i += 2
             continue
-        if c == "'" and not in_double:
+        if quotes and c == "'" and not in_double:
             in_single = True
             i += 1
             continue
-        if c == '"':
+        if quotes and c == '"':
             in_double = not in_double
             i += 1
             continue
@@ -1143,14 +1388,17 @@ def literal_assignment_value(raw, allow_glob=False):
     might expand or word-split it into something the hook can't predict.
 
     ``raw`` is post-shlex (quotes removed). A leading ``~``/``~/…`` is
-    expanded like bash expands it in assignments; ``~user``/unset-``$HOME``
-    stay unresolvable. An empty value is rejected because ``f=(a b)``
+    expanded like bash expands it in assignments; ``~user`` and an unresolvable
+    home stay unresolvable. An empty value is rejected because ``f=(a b)``
     tokenizes as ``f=`` + a paren run — treating it as the scalar empty
     string would miss the array's real ``$f`` (its first element).
 
     ``allow_glob`` keeps ``*?[`` instead of rejecting them; only
     ``literal_for_item`` passes it, and only it carries the argument for why a
     pattern is safe to keep.
+
+    On a drive-resolving platform a leading Windows drive prefix is exempt from
+    the ``:`` rule (Q48); a second colon anywhere in the value still rejects it.
     """
     if not raw:
         return None
@@ -1159,7 +1407,8 @@ def literal_assignment_value(raw, allow_glob=False):
     if raw.startswith('~'):
         return None
     impure = IMPURE_ITEM_CHARS if allow_glob else IMPURE_VALUE_CHARS
-    if any(c in impure for c in raw):
+    rest = raw[2:] if DRIVE_PATHS and DRIVE_PREFIX_RE.match(raw) else raw
+    if any(c in impure for c in rest):
         return None
     return raw
 
@@ -1183,11 +1432,16 @@ def literal_for_item(raw):
     is treated (``cat docs/*.md`` allows, ``cat /etc/*.conf`` asks), so the
     loop form now agrees with the direct form — including for a pattern that
     escapes (``../*.md``), which resolves outside and prompts rather than
-    needing a separate containment rule. Under ``shopt -s globstar`` a ``**``
-    can match extra segments the pattern doesn't show, which only makes a
-    trailing ``../`` in the loop body climb higher than bash will: an extra
-    prompt, never a missed one. Braces are still rejected above, so
+    needing a separate containment rule. Braces are still rejected above, so
     ``x{,/../..}`` can't smuggle a shorter path past the proxy.
+
+    The proxy holds only for patterns whose segment count is fixed. Under
+    ``shopt -s globstar`` a ``**`` matches a variable number of segments,
+    including zero (``docs/**`` expands to ``docs/`` as well as
+    ``docs/sub/b.md``), so a trailing ``../`` in the loop body can climb higher
+    at runtime than the pattern shows — a missed prompt, not an extra one.
+    Globstar is off by default in bash; closing this needs match enumeration
+    (Q47).
     """
     val = literal_assignment_value(raw, allow_glob=True)
     if val is None:
@@ -1197,7 +1451,7 @@ def literal_for_item(raw):
     return val
 
 
-def for_loop_binding(g):
+def for_loop_binding(g, loopmap):
     """Classify a command group as a `for NAME in <list>; …` loop header.
 
     Returns:
@@ -1206,8 +1460,9 @@ def for_loop_binding(g):
         every value (issue 70), a glob standing for its whole expansion
         (issue 99).
       * ``(name, None)`` — a `for NAME in` whose list has any non-literal or
-        brace item, an empty list, or a `for NAME` with no `in` (iterates
-        ``"$@"``): the caller drops NAME from the maps, keeping today's poison.
+        brace item, an empty list, a list over MAX_LOOP_CANDIDATES values, or a
+        `for NAME` with no `in` (iterates ``"$@"``): the caller drops NAME from
+        the maps, keeping today's poison.
       * ``None`` — not a `for NAME in` header at all (the `for ((…))` arithmetic
         form tokenizes with ``(`` at ``g[1]``), so the caller's existing
         ``poison_vars`` path runs unchanged.
@@ -1215,6 +1470,20 @@ def for_loop_binding(g):
     Must be called on the post-substitution tokens: a list item like ``$SP/a``
     with ``SP`` a known literal has already been resolved, so the bound value
     matches what bash iterates.
+
+    A list item may also use an enclosing loop's variable — ``for d in docs/*;
+    do for f in "$d"/*.md`` — so items are first expanded over ``loopmap``, and
+    the inner variable binds one candidate per (outer candidate, item) pair.
+    The cross product is what bash actually visits, and each pair is a
+    pattern-as-proxy in the issue 99 sense: the outer candidate contributes
+    whole segments, so the concatenation still has the segment structure of
+    every path it expands to. Expanding before the caller rebinds ``name``
+    reads the outer value, which is what bash expands the list with even when
+    the inner loop reuses the name.
+
+    The value count is capped incrementally, per item as well as in total, so a
+    list that would blow past MAX_LOOP_CANDIDATES stops being expanded at the
+    cap rather than after materialising the whole cross product (Q46).
     """
     if len(g) < 2 or os.path.basename(g[0]) != 'for':
         return None
@@ -1228,10 +1497,16 @@ def for_loop_binding(g):
         return (name, None)                       # empty list -> body never runs
     values = []
     for it in items:
-        val = literal_for_item(it)
-        if val is None:
-            return (name, None)                   # non-literal item -> poison
-        values.append(val)
+        cands = expand_loop_candidates(it, loopmap)
+        if cands is None:
+            return (name, None)                   # over-cap item -> poison
+        for cand in cands:
+            val = literal_for_item(cand)
+            if val is None:
+                return (name, None)               # non-literal item -> poison
+            values.append(val)
+            if len(values) > MAX_LOOP_CANDIDATES:
+                return (name, None)               # over-cap list -> poison
     return (name, values)
 
 
@@ -1253,6 +1528,13 @@ def expand_loop_candidates(tok, loopmap):
     backtick the hook won't evaluate). Several distinct loop variables in one
     token expand as the cross product; order is deterministic (variable order,
     then candidate order) so reasons and tests stay stable.
+
+    Returns None when that cross product would exceed MAX_LOOP_CANDIDATES — its
+    size is the product of the per-variable candidate counts, so it is known
+    before any expansion happens and the work is never done (Q46). Callers treat
+    None as a poison: the token keeps the runtime-expanded ``ask`` it had before
+    loop propagation existed. It is deliberately not a truncation to the first N
+    candidates, which would check a prefix and silently allow the rest.
     """
     if not loopmap or '$' not in tok or '`' in tok:
         return [tok]
@@ -1263,6 +1545,11 @@ def expand_loop_candidates(tok, loopmap):
             names.append(nm)
     if not names:
         return [tok]
+    total = 1
+    for nm in names:
+        total *= len(loopmap[nm])
+        if total > MAX_LOOP_CANDIDATES:
+            return None
     results = [tok]
     for nm in names:
         expanded = []
@@ -1352,10 +1639,7 @@ def poison_vars(g, varmap):
     """
     if not varmap:
         return
-    i = 0
-    while i < len(g) and g[i] in SH_KEYWORDS:
-        i += 1
-    rest = g[i:]
+    rest = strip_sh_keywords(g)
     if rest:
         name0 = os.path.basename(rest[0])
         if name0 in POISON_ALL_CMDS:
@@ -1379,6 +1663,45 @@ def poison_vars(g, varmap):
         elif IDENT_RE.fullmatch(t) and j + 1 < len(g) \
                 and g[j + 1].startswith('='):
             varmap.pop(t, None)
+
+
+def clobbers_ifs(g):
+    """True when group ``g`` may leave IFS holding a value the hook can't see.
+
+    A changed IFS re-splits every later expansion, so a value the hook checks
+    as one word can reach the command as several: under ``IFS=x``,
+    ``f=docs/x/opt/secret`` resolves inside the workspace for the hook but
+    reaches ``cat`` as ``docs/`` and ``/opt/secret`` (Q49).
+
+    ``apply_assignment_group`` catches the plain and ``export NAME=`` forms.
+    This catches the rest — ``eval``/``source``/``.``, which can set it
+    invisibly, and the arg-assigner builtins whose arguments name it
+    (``declare IFS=x``, ``read IFS``, ``printf -v IFS``, and the ``for IFS in
+    …`` header ``for_loop_binding`` refuses to bind). An argument still holding
+    a ``$`` names a variable the hook can't identify, so it counts too.
+
+    Dispatch mirrors ``poison_vars`` so the two can't disagree about what a
+    group assigns. That costs a ``select`` list containing a ``$`` an early end
+    to propagation, which can only cause an `ask`.
+
+    ``unset`` is exempt: bash word-splits on the default IFS while IFS is
+    unset, and the default is what the hook already models.
+    """
+    rest = strip_sh_keywords(g)
+    if not rest:
+        return False
+    name0 = os.path.basename(rest[0])
+    if name0 in POISON_ALL_CMDS:
+        return True
+    if name0 == 'unset' or name0 not in ARG_ASSIGNER_CMDS:
+        return False
+    for t in rest[1:]:
+        if '$' in t:
+            return True
+        m = IDENT_RE.match(t)
+        if m and m.group(0) == 'IFS':
+            return True
+    return False
 
 
 def split_operator_runs(tokens):
@@ -1433,17 +1756,22 @@ def split_eq(tok):
 
 
 def expand_tilde(tok):
-    """Expand a leading `~` or `~/…` to `$HOME` (bash does this deterministically).
+    """Expand a leading `~` or `~/…` to the home directory (bash does this
+    deterministically).
 
     Returns the expanded absolute path, or the token unchanged when it can't be
-    resolved here: a `~user`/`~+`/`~-` prefix (no plain `~` or `~/`) or an unset
-    `$HOME`. Callers still defer on a returned token that begins with `~` or
-    contains an expanding `$` (see EXPANSION_RE), so only the deterministic,
-    fully-resolvable cases are expanded
+    resolved here: a `~user`/`~+`/`~-` prefix (no plain `~` or `~/`) or no
+    resolvable home. Callers still defer on a returned token that begins with
+    `~` or contains an expanding `$` (see EXPANSION_RE), so only the
+    deterministic, fully-resolvable cases are expanded
     — `~user`'s pwd lookup and `~+`/`~-`'s dir-stack state stay out of scope.
+
+    The home comes from :func:`resolved_home`, not `$HOME`: on Windows the hook
+    runs under cmd.exe with `HOME` unset, so reading the variable left `~/x`
+    unexpanded and the hook deferred while bash expanded it anyway (Q43).
     """
     if tok == '~' or tok.startswith('~/'):
-        home = os.environ.get('HOME')
+        home = resolved_home()
         if home:
             return home if tok == '~' else os.path.join(home, tok[2:])
     return tok
@@ -1725,10 +2053,10 @@ def classify_cd(tokens):
         sub = CD_SUBST.get(normalize_subst(t))
         if sub is not None:
             return ('subst', sub)
-        arg = expand_tilde(t)                     # `cd ~/proj` tracks via $HOME
+        arg = expand_tilde(t)                     # `cd ~/proj` tracks via home
         if arg.startswith('+') or arg.startswith('~') or '$' in arg:
             return ('unknown', None)
-        return ('arg', arg)
+        return ('arg', msys_to_native(arg))       # `cd /c/proj` tracks the drive
     return ('unknown', None)                      # bare `cd` -> $HOME
 
 
@@ -1962,10 +2290,10 @@ def build_context(data):
         proj=proj, cwd=cwd, session_id=session_id,
         session_tmp_root=session_tmp_root,
         session_proj_dir=claude_session_project_dir(session_id, session_tmp_root),
-        tmp_roots=host_temp_roots(),
+        tmp_roots=host_temp_roots(cwd),
         tmp_allow=host_temp_allowlist(),
         tmp_action=host_temp_action(),
-        read_prefixes=allowed_read_prefixes(),
+        read_prefixes=allowed_read_prefixes(cwd),
         session_wt=resolve_session_worktree(proj),
         sib_override=sibling_override())
 
@@ -2015,7 +2343,7 @@ def classify_outside(rp, ctx, is_read):
     # Claude-managed temp root (keeps cross-session ask) or explicitly allowed.
     if is_host_temp(rp, ctx.tmp_roots) \
             and not path_at_or_under(rp, ctx.session_tmp_root):
-        if matches_allowlist(rp, ctx.tmp_allow):
+        if matches_allowlist(rp, ctx.tmp_allow, ctx.cwd):
             return None
         return ('hosttemp', None)
     return ('outside', None)
@@ -2047,7 +2375,11 @@ def resolve_native_path(raw, cwd):
     Native tools pass literal paths (no shell expansion), so beyond the
     deterministic ``~``/``~/…`` that ``expand_tilde`` handles, a leftover ``~``
     or any ``$`` is treated as unresolvable and the caller defers to builtin
-    permissions — the posture the edit handler has used since the sibling deny."""
+    permissions — the posture the edit handler has used since the sibling deny.
+
+    No :func:`msys_to_native` pass: these tools are not the shell, so on Windows
+    they read a leading slash as drive-relative themselves, and the guard has to
+    agree with the tool whose call it is judging."""
     if not raw or not isinstance(raw, str):
         return None
     p = expand_tilde(raw)
@@ -2177,9 +2509,10 @@ def analyze_command(cmd, ctx, base_cwd, depth=0):
             return ('skip', None)
         if is_allowed_device(f):
             return ('skip', None)
-        # Bash expands `~`/`~/…` to $HOME deterministically — resolve it here so
-        # an in-workspace home path isn't needlessly flagged. `~user`/`~+`/`~-`,
-        # an unset $HOME, and any `$VAR`/`$(...)` stay 'expand' (unresolvable).
+        # Bash expands `~`/`~/…` to the home dir deterministically — resolve it
+        # here so an in-workspace home path isn't needlessly flagged.
+        # `~user`/`~+`/`~-`, an unresolvable home, and any `$VAR`/`$(...)` stay
+        # 'expand' (unresolvable).
         # A `$` bash keeps literal (trailing, or before e.g. `.`/`/` — see
         # EXPANSION_RE) is part of the filename and falls through to realpath.
         f = expand_tilde(f)
@@ -2193,6 +2526,9 @@ def analyze_command(cmd, ctx, base_cwd, depth=0):
             f = resolve_subst_prefix(f, group_cwd)
         if f.startswith('~') or EXPANSION_RE.search(f):
             return ('expand', None)
+        # Last, so a `$VAR` is never rewritten before it's recognised as one:
+        # read a leading-slash path the way Git Bash will (a no-op elsewhere).
+        f = msys_to_native(f)
         if os.path.isabs(f):
             return ('path', os.path.realpath(f))
         if group_cwd_unknown:
@@ -2225,8 +2561,14 @@ def analyze_command(cmd, ctx, base_cwd, depth=0):
         concrete path per candidate (issue 70); every candidate is checked and
         the first that lands outside is returned (naming that resolved
         candidate, not the `$VAR` token). Tokens with no loop variable are a
-        single candidate — the original single-path check."""
-        for cand in expand_loop_candidates(f, loopmap):
+        single candidate — the original single-path check. A token whose
+        candidate set is over the cap is reported as 'expand' — it IS a
+        runtime-expanded token, and enumerating it is what hung the hook (Q46).
+        """
+        cands = expand_loop_candidates(f, loopmap)
+        if cands is None:
+            return (f, 'expand', None)
+        for cand in cands:
             kind, rp = resolve_token(cand, group_cwd, group_cwd_unknown)
             if kind == 'skip':
                 continue
@@ -2305,6 +2647,9 @@ def analyze_command(cmd, ctx, base_cwd, depth=0):
             o = check_file(f, group_cwd, group_cwd_unknown)
             if o is not None:
                 outside.append(o)
+        # A nested loop's header shares its group with the enclosing `do`, so
+        # the reserved words come off before the for-header check too.
+        kw_g = strip_sh_keywords(sub_g)
         if propagate:
             assigned = apply_assignment_group(g, varmap, persists)
             if assigned is not None:
@@ -2312,13 +2657,13 @@ def analyze_command(cmd, ctx, base_cwd, depth=0):
                 for nm in assigned:
                     loopmap.pop(nm, None)
                 if 'IFS' in assigned:
-                    # A changed IFS alters how bash word-splits every later
-                    # expansion — stop propagating for the rest of the string.
+                    # See clobbers_ifs: a changed IFS re-splits every later
+                    # expansion, so stop propagating for the rest of the string.
                     varmap.clear()
                     loopmap.clear()
                     propagate = False
                 continue                          # assignment-only group
-            forbind = for_loop_binding(sub_g)
+            forbind = for_loop_binding(kw_g, loopmap)
             if forbind is not None:
                 name, values = forbind
                 varmap.pop(name, None)            # a loop var isn't a scalar
@@ -2327,9 +2672,13 @@ def analyze_command(cmd, ctx, base_cwd, depth=0):
                 else:
                     loopmap[name] = values
                 continue                          # for-header: nothing to check
-            poison_vars(sub_g, varmap)
-            poison_vars(sub_g, loopmap)           # same rules invalidate loops
-        kw_g = strip_sh_keywords(sub_g)
+            if clobbers_ifs(sub_g):
+                varmap.clear()
+                loopmap.clear()
+                propagate = False
+            else:
+                poison_vars(sub_g, varmap)
+                poison_vars(sub_g, loopmap)       # same rules invalidate loops
         g = strip_env_prefix(kw_g)
         if not g: continue                        # keyword/env-only or redirect-only group
         kind, arg = classify_cd(g)
@@ -2401,8 +2750,19 @@ def analyze_command(cmd, ctx, base_cwd, depth=0):
     # ops would otherwise be invisible. Each body resolves against the same
     # `base_cwd`; only its OFFENDERS bubble up — its `guarded` is dropped, so a
     # clean substitution never produces an `allow`. (Q33)
+    #
+    # Heredoc bodies come out of the command line first: a `cat <<'EOF'` body is
+    # literal data to bash, so a `$(…)` written there never runs, while a
+    # `<<EOF` body is expanded and does need scanning (Q35). The expanded ones
+    # are scanned as their own units, with `quotes=False` — inside a heredoc
+    # body bash applies no quoting, so an apostrophe there is text, not the
+    # start of a quoted run that would swallow a later `$(…)`. (Q50)
     if depth < MAX_SUBST_DEPTH:
-        for body in command_substitutions(cmd):
+        heredocs = []
+        subs = command_substitutions(strip_heredoc_bodies(cmd, expanded=heredocs))
+        for hd in heredocs:
+            subs.extend(command_substitutions(hd, quotes=False))
+        for body in subs:
             sub_off, _ = analyze_command(body, ctx, base_cwd, depth + 1)
             outside.extend(sub_off)
     return outside, guarded
@@ -2502,16 +2862,749 @@ def handle_read_tool(data):
     emit(decision, reason)
 
 
+# --- PowerShell tool --------------------------------------------------------
+# Claude Code ships two shell tools. A Windows session without Git for Windows
+# — or any session with CLAUDE_CODE_USE_POWERSHELL_TOOL=1 — gets `PowerShell`
+# instead of `Bash`, and until Q51 nothing below matched it: the plugin loaded,
+# reported itself active, and checked no shell command at all. The native file
+# tools stayed guarded throughout, which is what made it easy to miss.
+#
+# This is a separate frontend, not a SPEC row. PowerShell is not a POSIX shell
+# and every difference falls in the unsafe direction — most of all the escape
+# character, which is a backtick. `shlex` reads `C:\Users\x` as escapes and
+# yields `C:Usersx`, a path that resolves INSIDE the project root. That is a
+# silent allow on the commonest Windows path form, so the tokenizer, the cmdlet
+# table, and the parameter grammar are all its own. Only `classify_outside` /
+# `decide` are shared, so a PowerShell `Get-Content` and a bash `cat` of the
+# same path can't reach different verdicts.
+#
+# Posture: parse a known subset, defer on the rest. An `ask` on everything
+# unparsed is the stricter reading, but the table covers little enough that
+# nearly every command would prompt, and a guard that noisy gets switched off.
+# The honest cost is in README's Limitations: the unparsed tail is unguarded and
+# the gap is invisible to the user.
+
+# CommonParameters. Present on every cmdlet, so they belong in every row's name
+# space or prefix resolution mis-resolves against an incomplete set.
+_PS_COMMON_CONSUME = frozenset({
+    'erroraction', 'warningaction', 'informationaction', 'progressaction',
+    'errorvariable', 'warningvariable', 'informationvariable',
+    'outvariable', 'outbuffer', 'pipelinevariable'})
+_PS_COMMON_SWITCHES = frozenset({'verbose', 'debug', 'whatif', 'confirm'})
+
+# Every guarded row names its file parameters, its value-taking parameters, and
+# its switches. The asymmetry that matters: failing to declare a value-taking
+# parameter leaks its value into the positional list, which for a row with
+# role-differentiated positionals SHIFTS every later operand — `Set-Content
+# -Encoding UTF8 C:\out\x` would bind `UTF8` as the target and `C:\out\x` as the
+# value, a silent allow. Wrongly declaring one only swallows a token that then
+# resolves cwd-relative, a harmless prompt. So `consume` is enumerated in full
+# from the cmdlet signature; guessing is what breaks it, in the bad direction.
+def _ps_row(files, consume=(), switches=(), positional=()):
+    consume = frozenset(consume) | _PS_COMMON_CONSUME
+    switches = frozenset(switches) | _PS_COMMON_SWITCHES
+    return {'files': files, 'consume': consume,
+            'positional': list(positional),
+            'names': frozenset(files) | consume | switches}
+
+
+# `-Path`/`-LiteralPath` name the operand on nearly every provider cmdlet; the
+# role differs per row, so the dict is spelled out rather than shared.
+PS_SPEC = {
+    # Reads. `positional` gives the role of each positional operand in order;
+    # operands past the end repeat the last entry, which is what makes
+    # `-Path`'s array binding (`Remove-Item a b c`) come out right.
+    'get-content': _ps_row(
+        {'path': 'read', 'literalpath': 'read'},
+        consume=('readcount', 'totalcount', 'head', 'tail', 'filter',
+                 'include', 'exclude', 'credential', 'delimiter', 'encoding',
+                 'stream'),
+        switches=('force', 'wait', 'raw', 'asbytestream'),
+        positional=('path',)),
+    # PowerShell's grep. Position 0 is -Pattern, not a file — binding it as one
+    # would resolve the regex cwd-relative and mask the real operand at 1.
+    'select-string': _ps_row(
+        {'path': 'read', 'literalpath': 'read'},
+        consume=('pattern', 'inputobject', 'include', 'exclude', 'encoding',
+                 'context', 'culture'),
+        switches=('simplematch', 'casesensitive', 'quiet', 'list', 'raw',
+                  'notmatch', 'allmatches', 'noemphasis'),
+        positional=('pattern', 'path')),
+    'import-csv': _ps_row(
+        {'path': 'read', 'literalpath': 'read'},
+        consume=('delimiter', 'header', 'encoding'),
+        switches=('useculture',),
+        positional=('path',)),
+    'import-clixml': _ps_row(
+        {'path': 'read', 'literalpath': 'read'},
+        consume=('skip', 'first'),
+        switches=('includetotalcount',),
+        positional=('path',)),
+    # Writes. Position 1 of Set-Content/Add-Content is -Value, not a path.
+    'set-content': _ps_row(
+        {'path': 'write', 'literalpath': 'write'},
+        consume=('value', 'filter', 'include', 'exclude', 'credential',
+                 'encoding', 'stream'),
+        switches=('passthru', 'force', 'nonewline', 'asbytestream'),
+        positional=('path', 'value')),
+    'add-content': _ps_row(
+        {'path': 'write', 'literalpath': 'write'},
+        consume=('value', 'filter', 'include', 'exclude', 'credential',
+                 'encoding', 'stream'),
+        switches=('passthru', 'force', 'nonewline', 'asbytestream'),
+        positional=('path', 'value')),
+    'out-file': _ps_row(
+        {'filepath': 'write', 'literalpath': 'write'},
+        consume=('encoding', 'width', 'inputobject'),
+        switches=('append', 'force', 'noclobber', 'nonewline'),
+        positional=('filepath',)),
+    'tee-object': _ps_row(
+        {'filepath': 'write', 'literalpath': 'write'},
+        consume=('inputobject', 'variable'),
+        switches=('append',),
+        positional=('filepath',)),
+    'export-csv': _ps_row(
+        {'path': 'write', 'literalpath': 'write'},
+        consume=('inputobject', 'delimiter', 'encoding', 'quotefields',
+                 'usequotes'),
+        switches=('append', 'force', 'noclobber', 'notypeinformation',
+                  'includetypeinformation', 'useculture', 'noheader'),
+        positional=('path',)),
+    'export-clixml': _ps_row(
+        {'path': 'write', 'literalpath': 'write'},
+        consume=('inputobject', 'depth', 'encoding'),
+        switches=('force', 'noclobber'),
+        positional=('path',)),
+    # Mutations. Source and destination are both checked; the boundary doesn't
+    # care which is which, but the read/write split does — a read of the source
+    # keeps the read-prefix exemption, a write of the destination doesn't.
+    'copy-item': _ps_row(
+        {'path': 'read', 'literalpath': 'read', 'destination': 'write'},
+        consume=('filter', 'include', 'exclude', 'credential', 'fromsession',
+                 'tosession'),
+        switches=('container', 'force', 'recurse', 'passthru'),
+        positional=('path', 'destination')),
+    'move-item': _ps_row(
+        {'path': 'read', 'literalpath': 'read', 'destination': 'write'},
+        consume=('filter', 'include', 'exclude', 'credential'),
+        switches=('force', 'passthru'),
+        positional=('path', 'destination')),
+    'remove-item': _ps_row(
+        {'path': 'write', 'literalpath': 'write'},
+        consume=('filter', 'include', 'exclude', 'credential', 'stream'),
+        switches=('recurse', 'force'),
+        positional=('path',)),
+    # -NewName is a name, not a path: it can't carry the operand out of root.
+    'rename-item': _ps_row(
+        {'path': 'write', 'literalpath': 'write'},
+        consume=('newname', 'credential'),
+        switches=('force', 'passthru'),
+        positional=('path', 'newname')),
+}
+
+# Not guarded — `Set-Location` reads no file — but tracked, because without it
+# `Set-Location C:\out; Get-Content secrets.txt` resolves the relative operand
+# against the session cwd and silently allows it. Mirrors the bash cd tracking.
+PS_LOCATION_SPEC = _ps_row(
+    {'path': 'read', 'literalpath': 'read'},
+    consume=('stackname',), switches=('passthru',), positional=('path',))
+PS_LOCATION_CMDS = frozenset({'set-location', 'push-location', 'pop-location'})
+
+# PowerShell resolves aliases before parameters, and several collide with the
+# POSIX names in SPEC while meaning something with a different flag set — `cat`
+# is Get-Content, `sc` is Set-Content, `rm` is Remove-Item. Routing those to the
+# SPEC row of the same name is exactly the aliasing mistake Q3 recorded.
+PS_ALIASES = {
+    'gc': 'get-content', 'cat': 'get-content', 'type': 'get-content',
+    'sls': 'select-string',
+    'ipcsv': 'import-csv', 'epcsv': 'export-csv',
+    'sc': 'set-content', 'set': 'set-content',
+    'ac': 'add-content',
+    'tee': 'tee-object',
+    'cpi': 'copy-item', 'copy': 'copy-item', 'cp': 'copy-item',
+    'mi': 'move-item', 'move': 'move-item', 'mv': 'move-item',
+    'ri': 'remove-item', 'rm': 'remove-item', 'del': 'remove-item',
+    'erase': 'remove-item', 'rd': 'remove-item', 'rmdir': 'remove-item',
+    'rni': 'rename-item', 'ren': 'rename-item',
+    'cd': 'set-location', 'sl': 'set-location', 'chdir': 'set-location',
+    'pushd': 'push-location', 'popd': 'pop-location',
+}
+
+# `@"` / `@'` opens a here-string; the body ends at a line whose first
+# non-blank characters are the closing delimiter.
+PS_HERE_OPEN_RE = re.compile(r"@([\"'])[ \t]*\r?\n")
+
+
+def ps_strip_here_strings(text, literal_only=False):
+    """Replace here-string bodies with an empty literal, or None if one is open.
+
+    Body text is arbitrary data — it may hold unbalanced quotes, `#`, or
+    anything else that would derail the tokenizer — so it never reaches it.
+    `literal_only` keeps the expandable (`@"`) form intact for the subexpression
+    scan, since PowerShell *does* run a `$(…)` written there; the literal (`@'`)
+    form is inert and drops either way. Same split as the bash heredoc handling
+    in Q35.
+    """
+    out, i = [], 0
+    while True:
+        m = PS_HERE_OPEN_RE.search(text, i)
+        if not m:
+            out.append(text[i:])
+            return ''.join(out)
+        close = re.compile(r"\r?\n[ \t]*" + re.escape(m.group(1)) + r"@")
+        e = close.search(text, m.end() - 1)
+        if not e:
+            return None                       # unterminated -> caller defers
+        if literal_only and m.group(1) == '"':
+            out.append(text[i:e.end()])
+        else:
+            out.append(text[i:m.start()])
+            out.append("''")
+        i = e.end()
+
+
+def _ps_scan_paren(text, start):
+    """Index just past the `)` balancing the `(` at `start`, or None.
+
+    Single-quoted runs are opaque. Double-quoted runs are not: PowerShell
+    expands `$(…)` inside them, so a nested subexpression is scanned rather than
+    skipped — otherwise a `)` in ordinary quoted prose would close the wrong
+    paren and truncate the body.
+    """
+    depth, i, n = 0, start, len(text)
+    while i < n:
+        c = text[i]
+        if c == '`':
+            i += 2
+            continue
+        if c == "'":
+            i += 1
+            while i < n and text[i] != "'":
+                i += 1
+            i += 1
+            continue
+        if c == '"':
+            i += 1
+            while i < n and text[i] != '"':
+                if text[i] == '`':
+                    i += 2
+                    continue
+                if text[i] == '$' and i + 1 < n and text[i + 1] == '(':
+                    j = _ps_scan_paren(text, i + 1)
+                    if j is None:
+                        return None
+                    i = j
+                    continue
+                i += 1
+            i += 1
+            continue
+        if c == '(':
+            depth += 1
+        elif c == ')':
+            depth -= 1
+            if depth == 0:
+                return i + 1
+        i += 1
+    return None
+
+
+def ps_subexpressions(text, depth=0):
+    """Split `$(…)` / `@(…)` out of `text`.
+
+    Returns `(masked, bodies)`. Each subexpression is replaced by a bare `$` so
+    the token that contained it still reads as runtime-expanded, and its body is
+    returned for analysis in its own right — the same strictly-friction-adding
+    treatment bash command substitutions get, and for the same reason: a guarded
+    cmdlet written inside one is invisible to the outer tokenizer.
+    """
+    out, bodies, i, n = [], [], 0, len(text)
+    while i < n:
+        c = text[i]
+        if c == '`':
+            out.append(text[i:i + 2])
+            i += 2
+            continue
+        if c == "'":
+            j = i + 1
+            while j < n and text[j] != "'":
+                j += 1
+            out.append(text[i:j + 1])
+            i = j + 1
+            continue
+        if c in '$@' and i + 1 < n and text[i + 1] == '(':
+            j = _ps_scan_paren(text, i + 1)
+            if j is None:
+                out.append(c)
+                i += 1
+                continue
+            body = text[i + 2:j - 1]
+            bodies.append(body)
+            if depth < MAX_SUBST_DEPTH:
+                bodies.extend(ps_subexpressions(body, depth + 1)[1])
+            out.append('$')
+            i = j
+            continue
+        if c == '"':
+            j, seg, closed = i + 1, ['"'], False
+            while j < n:
+                if text[j] == '"':
+                    closed = True
+                    break
+                if text[j] == '`':
+                    seg.append(text[j:j + 2])
+                    j += 2
+                    continue
+                if text[j] == '$' and j + 1 < n and text[j + 1] == '(':
+                    k = _ps_scan_paren(text, j + 1)
+                    if k is None:
+                        break
+                    body = text[j + 2:k - 1]
+                    bodies.append(body)
+                    if depth < MAX_SUBST_DEPTH:
+                        bodies.extend(ps_subexpressions(body, depth + 1)[1])
+                    seg.append('$')
+                    j = k
+                    continue
+                seg.append(text[j])
+                j += 1
+            # Never close the run that the input left open: fabricating the
+            # quote here would hand the tokenizer a balanced string, and an
+            # unbalanced command has to defer rather than half-parse.
+            if closed:
+                seg.append('"')
+                j += 1
+            out.append(''.join(seg))
+            i = j
+            continue
+        out.append(c)
+        i += 1
+    return ''.join(out), bodies
+
+
+def ps_tokenize(text):
+    """Tokenize a PowerShell command line in argument mode.
+
+    Returns `(kind, value, expandable, quoted)` tuples — kind is 'word', 'op'
+    (a command separator) or 'redir' — or None when a quote is left open, which
+    defers the whole command.
+
+    `expandable` records a `$` seen outside single quotes: the value is decided
+    at runtime, so the caller reports the token rather than resolving it.
+    `quoted` records that some part of the value came from quotes, which is what
+    stops an array operand (`-Path a,b`) from being split inside a quoted name.
+    """
+    toks = []
+    buf, expandable, quoted, started = [], False, False, False
+
+    def flush():
+        if started:
+            toks.append(('word', ''.join(buf), expandable, quoted))
+        del buf[:]
+        return False, False, False
+
+    i, n = 0, len(text)
+    while i < n:
+        c = text[i]
+        if c in ' \t\r':
+            expandable, quoted, started = flush()
+            i += 1
+            continue
+        if c == '\n':
+            expandable, quoted, started = flush()
+            toks.append(('op', '\n', False, False))
+            i += 1
+            continue
+        if c == '#' and not started:                     # line comment
+            while i < n and text[i] != '\n':
+                i += 1
+            continue
+        if not started and text.startswith('<#', i):     # block comment
+            end = text.find('#>', i + 2)
+            i = n if end < 0 else end + 2
+            continue
+        if c == '`':
+            if i + 1 >= n:
+                i += 1
+                continue
+            if text[i + 1] == '\n':                      # line continuation
+                i += 2
+                continue
+            buf.append(text[i + 1])
+            started = True
+            i += 2
+            continue
+        if c == "'":
+            started, quoted = True, True
+            i += 1
+            while True:
+                if i >= n:
+                    return None
+                if text[i] == "'":
+                    if i + 1 < n and text[i + 1] == "'":
+                        buf.append("'")
+                        i += 2
+                        continue
+                    i += 1
+                    break
+                buf.append(text[i])
+                i += 1
+            continue
+        if c == '"':
+            started, quoted = True, True
+            i += 1
+            while True:
+                if i >= n:
+                    return None
+                ch = text[i]
+                if ch == '`' and i + 1 < n:
+                    buf.append(text[i + 1])
+                    i += 2
+                    continue
+                if ch == '"':
+                    if i + 1 < n and text[i + 1] == '"':
+                        buf.append('"')
+                        i += 2
+                        continue
+                    i += 1
+                    break
+                if ch == '$':
+                    expandable = True
+                buf.append(ch)
+                i += 1
+            continue
+        if c == '>':
+            # `2>` / `*>` glue the stream selector onto the operator; without
+            # this the selector flushes as a word and becomes a file operand.
+            pending = ''.join(buf)
+            if started and not quoted and (pending.isdigit() or pending == '*'):
+                op = pending + c
+                del buf[:]
+                expandable, quoted, started = False, False, False
+            else:
+                op = c
+                expandable, quoted, started = flush()
+            i += 1
+            if i < n and text[i] == '>':
+                op += '>'
+                i += 1
+            toks.append(('redir', op, False, False))
+            continue
+        if c in '|&':
+            expandable, quoted, started = flush()
+            op = c
+            if i + 1 < n and text[i + 1] == c:
+                op += c
+                i += 1
+            toks.append(('op', op, False, False))
+            i += 1
+            continue
+        if c in ';(){}':
+            # Script-block braces and grouping parens are separators, so a
+            # `ForEach-Object { Get-Content … }` body is analyzed as its own
+            # command instead of vanishing into the caller's operands.
+            expandable, quoted, started = flush()
+            toks.append(('op', c, False, False))
+            i += 1
+            continue
+        if c == '$':
+            expandable = True
+        buf.append(c)
+        started = True
+        i += 1
+    flush()
+    return toks
+
+
+def ps_expand_tilde(tok):
+    """Expand a leading `~`, `~/` or `~\\` — PowerShell accepts both separators."""
+    if tok == '~' or tok[:2] in ('~/', '~\\'):
+        home = resolved_home()
+        if home:
+            return home if tok == '~' else os.path.join(home, tok[2:])
+    return tok
+
+
+def ps_is_absolute(p):
+    """True for the path forms PowerShell resolves without the current directory:
+    drive-qualified (`C:\\x`), UNC (`\\\\host\\share`), and root-relative."""
+    return bool(DRIVE_PREFIX_RE.match(p)) or p.startswith('\\') \
+        or p.startswith('/')
+
+
+def ps_realpath(p, cwd):
+    """Resolve a PowerShell path token to a comparable absolute path.
+
+    No :func:`msys_to_native` pass, for the reason ``resolve_native_path`` gives:
+    the guard has to agree with the tool whose call it is judging. That mount
+    table is Git Bash's, and PowerShell has never heard of it — a leading slash
+    there is the root of the current drive, not `/c/…` or `%TMP%`.
+    """
+    full = p if ps_is_absolute(p) else os.path.join(cwd, p)
+    if DRIVE_PATHS:
+        return os.path.realpath(full)
+    # The PowerShell tool only exists on Windows, so a non-drive host here means
+    # the test suite. `os.path` does not consider `C:\x` absolute on POSIX, and
+    # handing it to realpath would resolve it against the process directory and
+    # land it INSIDE the project root — the fixture would then assert a silent
+    # allow and call it a pass. Normalize the native forms lexically instead; no
+    # POSIX root can contain a drive-qualified or UNC path. The test runs after
+    # the join, so a relative operand read under a tracked `Set-Location C:\…`
+    # is caught too.
+    if DRIVE_PREFIX_RE.match(full) or full.startswith('\\'):
+        return os.path.normpath(full.replace('\\', '/'))
+    return os.path.realpath(full)
+
+
+def ps_resolve_param(name, spec):
+    """Resolve a parameter name the way PowerShell does — exact match, else an
+    unambiguous prefix. An ambiguous or unknown name falls back to itself, where
+    it reads as a switch: the value behind it stays a positional operand and
+    still gets checked, which is the safe direction to be wrong in."""
+    if name in spec['names']:
+        return name
+    hits = [k for k in spec['names'] if k.startswith(name)]
+    return hits[0] if len(hits) == 1 else name
+
+
+def ps_bind_args(args, spec):
+    """Bind a segment's argument tokens to file roles.
+
+    Returns `(token, expandable, quoted, role)` for each operand that names a
+    file, role being 'read' or 'write'.
+
+    Two passes, because PowerShell binds by name first and only then fills the
+    positional slots that are still free. `Select-String -Pattern foo <file>`
+    puts the file in slot 1 (-Path) however the two are ordered; a single
+    left-to-right pass would hand it slot 0 (-Pattern), classify a real read as
+    a non-file operand, and allow it silently.
+    """
+    named, positionals, bound, i, n = [], [], set(), 0, len(args)
+    while i < n:
+        _, val, exp, quoted = args[i]
+        if val == '--%':
+            break                       # stop-parsing: the rest is verbatim
+        if len(val) > 1 and val[0] == '-' and not exp \
+                and not val[1].isdigit() and val[1] != '.':
+            name, attached = val[1:], None
+            if ':' in name:             # `-Path:C:\x` binds without a space
+                name, attached = name.split(':', 1)
+            key = ps_resolve_param(name.lower(), spec)
+            role = spec['files'].get(key)
+            if role:
+                # -Path and -LiteralPath are alternates for one slot, so
+                # binding either has to close it.
+                bound.update(k for k, v in spec['files'].items() if v == role)
+                if attached is not None:
+                    named.append((attached, exp, quoted, role))
+                elif i + 1 < n:
+                    _, nval, nexp, nquoted = args[i + 1]
+                    named.append((nval, nexp, nquoted, role))
+                    i += 1
+            else:
+                bound.add(key)
+                if key in spec['consume'] and attached is None:
+                    i += 1
+            i += 1
+            continue
+        positionals.append((val, exp, quoted))
+        i += 1
+
+    slots, pos = spec['positional'], 0
+    for val, exp, quoted in positionals:
+        while pos < len(slots) and slots[pos] in bound:
+            pos += 1
+        # Operands past the last slot repeat it — that is what makes -Path's
+        # array binding (`Remove-Item a b c`) come out right.
+        slot = slots[pos] if pos < len(slots) else (slots[-1] if slots else None)
+        pos += 1
+        role = spec['files'].get(slot)
+        if role:
+            named.append((val, exp, quoted, role))
+    return named
+
+
+def ps_path_parts(tok, quoted):
+    """Split an unquoted comma-joined array operand (`-Path a,b`) into paths.
+
+    Left whole when quoted, so a filename that genuinely contains a comma keeps
+    its name. Splitting an unquoted one is the safe direction: `-Path a,C:\\out`
+    checked as a single token would resolve cwd-relative and allow.
+    """
+    if not quoted and ',' in tok:
+        return [p for p in tok.split(',') if p]
+    return [tok]
+
+
+def ps_apply_location(words, cwd, cwd_unknown):
+    """Follow a Set-Location/Push-Location so later relative operands resolve
+    against the right directory. Anything the hook can't follow — a bare `cd`,
+    `cd -`, a `$var` target, `Pop-Location` — drops tracking, which turns later
+    relative operands into 'untracked' offenders rather than silent allows."""
+    name = PS_ALIASES.get(words[0][1].lower(), words[0][1].lower())
+    if name == 'pop-location':
+        return cwd, True
+    targets = [b for b in ps_bind_args(words[1:], PS_LOCATION_SPEC)
+               if b[3] == 'read']
+    if len(targets) != 1:
+        return cwd, True
+    tok, exp, _, _ = targets[0]
+    if exp or tok in ('-', '+'):
+        return cwd, True
+    p = ps_expand_tilde(tok)
+    if p.startswith('~'):
+        return cwd, True
+    if not ps_is_absolute(p) and cwd_unknown:
+        return cwd, True
+    return ps_realpath(p, cwd), False
+
+
+def ps_analyze_segment(tokens, ctx, cwd, cwd_unknown):
+    """Analyze one pipeline segment. Returns `(offenders, guarded, cwd,
+    cwd_unknown)` — the trailing pair carries location tracking to the next
+    segment in the chain."""
+    files, words, i, n = [], [], 0, len(tokens)
+    while i < n:
+        kind = tokens[i][0]
+        if kind == 'redir':
+            # A redirect target is a shell-level write, honored whatever the
+            # command word is — same as the bash side (Q26).
+            if i + 1 < n and tokens[i + 1][0] == 'word':
+                _, val, exp, quoted = tokens[i + 1]
+                files.append((val, exp, quoted, 'write'))
+                i += 2
+                continue
+            i += 1
+            continue
+        words.append(tokens[i])
+        i += 1
+
+    # `$out = Get-Content …` — drop the assignment so the cmdlet is the head.
+    if words and words[0][1].startswith('$'):
+        if len(words) > 1 and words[1][1] == '=':
+            words = words[2:]
+        elif words[0][1].endswith('='):
+            words = words[1:]
+    if words and words[0][1] == '.':        # dot-source operator
+        words = words[1:]
+
+    guarded = False
+    if words:
+        name = PS_ALIASES.get(words[0][1].lower(), words[0][1].lower())
+        if name in PS_LOCATION_CMDS:
+            cwd, cwd_unknown = ps_apply_location(words, cwd, cwd_unknown)
+        else:
+            spec = PS_SPEC.get(name)
+            if spec is not None:
+                guarded = True
+                files.extend(ps_bind_args(words[1:], spec))
+
+    offenders = []
+    for tok, exp, quoted, role in files:
+        if exp:
+            offenders.append((tok, 'expand', None))
+            continue
+        for part in ps_path_parts(tok, quoted):
+            p = ps_expand_tilde(part)
+            if p.startswith('~'):
+                offenders.append((part, 'expand', None))
+                continue
+            if not ps_is_absolute(p) and cwd_unknown:
+                offenders.append((part, 'untracked', None))
+                continue
+            rp = ps_realpath(p, cwd)
+            res = classify_outside(rp, ctx, is_read=(role == 'read'))
+            if res is not None:
+                disp = part if ps_is_absolute(part) \
+                    else offender_display(part, rp)
+                offenders.append((disp, res[0], res[1]))
+    return offenders, guarded, cwd, cwd_unknown
+
+
+def ps_analyze_command(cmd, ctx, base_cwd, depth=0):
+    """Analyze a PowerShell command string. Returns `(offenders, guarded)`,
+    matching `analyze_command`'s contract so the two frontends share the
+    emit logic below."""
+    if not cmd.strip():
+        return [], False
+    expandable_text = ps_strip_here_strings(cmd, literal_only=True)
+    stripped = ps_strip_here_strings(cmd)
+    if expandable_text is None or stripped is None:
+        return [], False                      # open here-string -> defer
+    bodies = ps_subexpressions(expandable_text)[1]
+    toks = ps_tokenize(ps_subexpressions(stripped)[0])
+    if toks is None:
+        return [], False                      # open quote -> defer
+
+    offenders, guarded = [], False
+    cwd, cwd_unknown, seg = base_cwd, False, []
+    for tok in toks + [('op', ';', False, False)]:
+        if tok[0] == 'op':
+            if seg:
+                off, g, cwd, cwd_unknown = ps_analyze_segment(
+                    seg, ctx, cwd, cwd_unknown)
+                offenders.extend(off)
+                guarded = guarded or g
+            seg = []
+        else:
+            seg.append(tok)
+
+    # Subexpression bodies contribute offenders only — a clean guarded cmdlet
+    # inside one never flips a deferring outer command into an `allow`.
+    if depth < MAX_SUBST_DEPTH:
+        for body in bodies:
+            offenders.extend(ps_analyze_command(body, ctx, base_cwd,
+                                                depth + 1)[0])
+    return offenders, guarded
+
+
+def handle_powershell(data):
+    """Guard the PowerShell shell tool.
+
+    A missing command field is NOT treated as ordinary uncertainty. The field
+    name comes from the installed binary rather than from documented schema
+    (see docs/plan/q51-powershell-tool.md), so deferring on its absence would be
+    indistinguishable from the wiring bug it would be hiding — a guard that
+    reports itself active and enforces nothing, the exact failure
+    run-python-hook.cmd exists to prevent. That case asks, and says why.
+    """
+    ti = data.get('tool_input')
+    if not isinstance(ti, dict) or not isinstance(ti.get('command'), str):
+        emit("ask", "workspace-guard could not read the PowerShell tool's "
+                    "command (tool_input.command), so it checked nothing about "
+                    "this command's file access. Approve only if you have read "
+                    "the command yourself, and please report this — the guard "
+                    "is meant to check every shell command.")
+        return
+    cmd = ti['command']
+    if not cmd.strip():
+        return
+    ctx = build_context(data)
+    outside, guarded = ps_analyze_command(cmd, ctx, ctx.cwd)
+    if not outside and not guarded:
+        return
+    if outside:
+        bypass = data.get("permission_mode") == "bypassPermissions"
+        decision, reason = decide(outside, ctx, bypass)
+    else:
+        decision, reason = "allow", "Guarded cmdlets target workspace only"
+    emit(decision, reason)
+
+
 def main():
     data = json.load(sys.stdin)
     tool = data.get('tool_name') or ''
-    # Absent tool_name (older CLIs, or the Bash-only matcher) -> Bash handling,
-    # preserving the original behavior.
-    if tool in ('Edit', 'Write', 'MultiEdit', 'NotebookEdit'):
+    # PowerShell is checked FIRST and never falls through. The default branch is
+    # Bash handling, and routing a PowerShell command into the POSIX tokenizer
+    # is the silent-allow the section above exists to avoid.
+    if tool == 'PowerShell':
+        handle_powershell(data)
+    elif tool in ('Edit', 'Write', 'MultiEdit', 'NotebookEdit'):
         handle_edit(data)
     elif tool in ('Read', 'Grep', 'Glob'):
         handle_read_tool(data)
     else:
+        # Absent tool_name (older CLIs) -> Bash handling, preserving the
+        # original behavior.
         handle_bash(data)
 
 

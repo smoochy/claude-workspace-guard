@@ -11,8 +11,10 @@ Three layers:
   * Wiring tests assert the plugin config (hooks.json, plugin.json,
     marketplace.json) is valid and points the hook at the real script.
 """
+import contextlib
 import json
 import os
+import shlex
 import shutil
 import subprocess
 import sys
@@ -20,9 +22,47 @@ import tempfile
 import unittest
 from importlib import util
 from pathlib import Path
+from unittest import mock
 
 REPO = Path(__file__).resolve().parent.parent
 SCRIPT = REPO / "scripts" / "bash-workspace-guard.py"
+
+
+def sh(path):
+    """Quote a native path for interpolation into a command-line fixture.
+
+    Windows paths carry backslashes, which the hook's POSIX tokenizer reads as
+    escapes — exactly as bash does, so an unquoted native path arrives mangled
+    (`C:\\ws\\in.txt` -> `C:wsin.txt`) and lands wherever the mangled name
+    resolves. Single-quoting is how a real command names such a path. A no-op
+    for the plain POSIX paths this returns elsewhere.
+    """
+    return shlex.quote(path)
+
+
+def native(path):
+    """POSIX-shaped literal -> this platform's separator, for helper unit tests
+    that pass paths straight to a helper instead of through ``realpath``."""
+    return path.replace("/", os.sep)
+
+
+def home_rel(path, home):
+    """``path`` relative to ``home``, slash-separated, for interpolating after a
+    `~/` in a command fixture. Windows' native `\\` would read as a shell escape;
+    bash and the hook's ``os.path.join`` both take `/` on either platform."""
+    return os.path.relpath(path, home).replace(os.sep, "/")
+
+
+def resolved_from(base, *parts):
+    """Resolve a path the way the hook will, from ``base``.
+
+    A leading-slash path is drive-relative on Windows, so it only equals what
+    the hook computes when resolved against the same cwd the command's own
+    arguments resolve against -- and since Q52, only after being read through
+    Git Bash's mount table first, which is what the shell will do with it.
+    Mirrors ``resolve_from`` in the script. A no-op on POSIX both ways."""
+    parts = [guard.msys_to_native(p) for p in parts]
+    return os.path.realpath(os.path.join(base, *parts))
 
 # Filename has a dash, so import by path.
 _spec = util.spec_from_file_location("workspace_guard", SCRIPT)
@@ -1073,17 +1113,17 @@ class AllowedReadPrefixesUnitTests(unittest.TestCase):
     def test_claude_projects_dir_under_home(self):
         cpd = guard.claude_projects_dir()
         if cpd is None:
-            self.skipTest("HOME not set")
-        home = os.environ.get("HOME")
-        self.assertTrue(cpd.startswith(home.rstrip("/") + "/") or cpd == home,
-                        f"expected {cpd!r} under HOME {home!r}")
+            self.skipTest("home directory not resolvable")
+        home = os.path.realpath(os.path.expanduser("~"))
+        self.assertTrue(cpd.startswith(home.rstrip(os.sep) + os.sep) or cpd == home,
+                        f"expected {cpd!r} under home {home!r}")
         self.assertTrue(cpd.endswith("projects") or "projects" in cpd)
 
     def test_allowed_read_prefixes_includes_projects_dir(self):
         cpd = guard.claude_projects_dir()
         if cpd is None:
-            self.skipTest("HOME not set")
-        prefixes = guard.allowed_read_prefixes()
+            self.skipTest("home directory not resolvable")
+        prefixes = guard.allowed_read_prefixes(os.getcwd())
         self.assertIn(cpd, prefixes)
 
     def test_allowed_read_prefixes_extras_via_env(self):
@@ -1091,7 +1131,7 @@ class AllowedReadPrefixesUnitTests(unittest.TestCase):
         old = os.environ.get("WORKSPACE_GUARD_READ_ALLOW_PREFIXES")
         try:
             os.environ["WORKSPACE_GUARD_READ_ALLOW_PREFIXES"] = fake
-            prefixes = guard.allowed_read_prefixes()
+            prefixes = guard.allowed_read_prefixes(os.getcwd())
         finally:
             if old is None:
                 os.environ.pop("WORKSPACE_GUARD_READ_ALLOW_PREFIXES", None)
@@ -1100,16 +1140,230 @@ class AllowedReadPrefixesUnitTests(unittest.TestCase):
         # realpath of /fake/read-allow-test on most systems = itself
         self.assertTrue(any(p.endswith("read-allow-test") for p in prefixes))
 
-    def test_allowed_read_prefixes_no_home(self):
+    def test_claude_projects_dir_without_home_env(self):
+        # Q40: the hook runs from cmd.exe on Windows, where HOME is unset. The
+        # prefix must survive that — expanduser reads USERPROFILE there, and the
+        # pwd database on POSIX.
         old_home = os.environ.get("HOME")
         try:
             os.environ.pop("HOME", None)
-            prefixes = guard.allowed_read_prefixes()
+            cpd = guard.claude_projects_dir()
         finally:
             if old_home is not None:
                 os.environ["HOME"] = old_home
-        # Without HOME, claude_projects_dir() returns None; env var still works.
-        self.assertIsInstance(prefixes, list)
+        self.assertIsNotNone(cpd)
+
+    def test_claude_projects_dir_unresolvable_home(self):
+        # expanduser hands back a bare `~` when no home resolves at all.
+        with mock.patch.object(os.path, "expanduser", return_value="~"):
+            self.assertIsNone(guard.claude_projects_dir())
+
+
+class TildeExpansionUnitTests(unittest.TestCase):
+    """Unit tests for resolved_home() and expand_tilde() (Q19, Q43)."""
+
+    @contextlib.contextmanager
+    def _without_home_env(self):
+        old = os.environ.pop("HOME", None)
+        try:
+            yield
+        finally:
+            if old is not None:
+                os.environ["HOME"] = old
+
+    def test_expand_tilde_without_home_env(self):
+        # Q43: on Windows the hook runs under cmd.exe with HOME unset. Reading
+        # the variable left `~/x` unexpanded, so a `~` path into the workspace
+        # asked and a native tool's `~` path deferred entirely.
+        with self._without_home_env():
+            self.assertEqual(guard.resolved_home(), os.path.expanduser("~"))
+            expanded = guard.expand_tilde("~/q43-fake-target")
+            self.assertTrue(os.path.isabs(expanded), expanded)
+            self.assertFalse(expanded.startswith("~"), expanded)
+            self.assertTrue(expanded.endswith("q43-fake-target"), expanded)
+            self.assertTrue(os.path.isabs(guard.expand_tilde("~")))
+
+    def test_native_path_with_tilde_resolves_without_home_env(self):
+        # Same regression on the native-tool side: an unexpanded `~` is treated
+        # as unresolvable and defers to builtin permissions, so the path went
+        # unchecked. It must resolve instead.
+        with self._without_home_env():
+            p = guard.resolve_native_path("~/q43-fake-target", os.getcwd())
+        self.assertIsNotNone(p)
+        self.assertTrue(os.path.isabs(p), p)
+
+    def test_expand_tilde_leaves_out_of_scope_prefixes(self):
+        # `~user` needs a pwd lookup and `~+`/`~-` need dir-stack state; both
+        # stay unexpanded so the caller keeps the runtime-expanded ask.
+        for tok in ("~someuser/x", "~+/x", "~-", "~+", "foo~bak"):
+            self.assertEqual(guard.expand_tilde(tok), tok)
+
+    def test_expand_tilde_unresolvable_home(self):
+        # expanduser hands back a bare `~` when no home resolves at all.
+        with mock.patch.object(os.path, "expanduser", return_value="~"):
+            self.assertIsNone(guard.resolved_home())
+            self.assertEqual(guard.expand_tilde("~/x"), "~/x")
+            self.assertEqual(guard.expand_tilde("~"), "~")
+
+
+class MsysPathFormTests(unittest.TestCase):
+    """Q52: a leading-slash path is read through Git Bash's mount table.
+
+    The expectations are the table measured on a windows-latest runner (Git
+    2.55, MSYSTEM=MINGW64) via `cygpath -w`, not a reading of the MSYS source.
+    `msys_to_native` is a pure string rewrite, so these run on every platform
+    with the Windows discriminator patched on; the integration is covered by
+    MsysPathFormWindowsTests, which only means anything on Windows.
+    """
+
+    FAKE_ROOT = r"C:\Program Files\Git"
+
+    @contextlib.contextmanager
+    def _on_windows(self, root=FAKE_ROOT, tmp=r"C:\Users\me\AppData\Local\Temp"):
+        with mock.patch.object(guard, "DRIVE_PATHS", True), \
+                mock.patch.object(guard, "msys_root", return_value=root), \
+                mock.patch.object(guard, "msys_tmp", return_value=tmp):
+            yield
+
+    def _expect(self, cases, **kw):
+        with self._on_windows(**kw):
+            for raw, want in cases.items():
+                self.assertEqual(guard.msys_to_native(raw), want, raw)
+
+    def test_drive_forms(self):
+        # `C: on /c` — the cygdrive prefix is `/`, and it applies to any single
+        # letter, including drives that don't exist (`/x/y` -> `X:\y`).
+        self._expect({
+            "/c": "C:/",
+            "/c/": "C:/",
+            "/c/Users/foo": "C:/Users/foo",
+            "/C/Users/foo": "C:/Users/foo",
+            "/d/a/proj": "D:/a/proj",
+            "/x/y": "X:/y",
+        })
+
+    def test_tmp_is_the_usertemp_mount(self):
+        # `<%TMP%> on /tmp type usertemp` — NOT <root>/tmp. This is the mount
+        # that made the host-temp `deny` fire on the right path.
+        self._expect({
+            "/tmp": r"C:\Users\me\AppData\Local\Temp",
+            "/tmp/x": r"C:\Users\me\AppData\Local\Temp/x",
+        })
+
+    def test_bin_is_its_own_mount(self):
+        # `C:/Program Files/Git/usr/bin on /bin` — one level deeper than the
+        # `/` rule would put it.
+        self._expect({
+            "/bin": r"C:\Program Files\Git/usr/bin",
+            "/bin/bash": r"C:\Program Files\Git/usr/bin/bash",
+        })
+
+    def test_everything_else_hangs_off_the_root(self):
+        self._expect({
+            "/etc/passwd": r"C:\Program Files\Git/etc/passwd",
+            "/usr/bin/env": r"C:\Program Files\Git/usr/bin/env",
+            "/var/tmp/x": r"C:\Program Files\Git/var/tmp/x",
+            "/home/me": r"C:\Program Files\Git/home/me",
+            # No WSL or cygdrive mount: these are ordinary directories.
+            "/mnt/c/foo": r"C:\Program Files\Git/mnt/c/foo",
+        })
+
+    def test_untouched_forms(self):
+        # Only a leading slash is ambiguous; a native path, a relative path and
+        # a `~` that expand_tilde already resolved all pass straight through.
+        self._expect({
+            r"C:\ws\in.txt": r"C:\ws\in.txt",
+            "notes.txt": "notes.txt",
+            "../sib/x": "../sib/x",
+            "": "",
+        })
+
+    def test_no_git_bash_leaves_non_drive_paths_alone(self):
+        # Without a locatable root the guard keeps its pre-Q52 drive-relative
+        # reading rather than inventing one: an over-prompt, never an allow.
+        # Drive and /tmp forms need no root and still resolve.
+        self._expect({
+            "/etc/passwd": "/etc/passwd",
+            "/bin/bash": "/bin/bash",
+            "/c/Users/foo": "C:/Users/foo",
+            "/tmp/x": r"C:\Users\me\AppData\Local\Temp/x",
+        }, root=None)
+
+    def test_posix_is_untouched(self):
+        # The discriminator is drive resolution, so on POSIX — where these are
+        # real paths — nothing is rewritten.
+        with mock.patch.object(guard, "DRIVE_PATHS", False):
+            for raw in ("/c/Users/foo", "/tmp/x", "/etc/passwd", "/bin/bash"):
+                self.assertEqual(guard.msys_to_native(raw), raw)
+
+
+class MsysRootDiscoveryTests(unittest.TestCase):
+    """Q52: locating Git Bash's `/` from the hook's own (cmd.exe) environment.
+
+    `where.exe bash` on a stock windows-latest runner returns Git's bash first
+    and `C:\\Windows\\System32\\bash.exe` — the WSL launcher — second. Without
+    Git for Windows only the latter is on PATH, so the marker check is what
+    keeps `/etc/passwd` from being reported under `C:\\Windows`.
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.addCleanup(setattr, guard, "_msys_root_cached", ())
+        self.root = os.path.join(self._tmp.name, "Git")
+        os.makedirs(os.path.join(self.root, "usr", "bin"))
+        os.makedirs(os.path.join(self.root, "bin"))
+        os.makedirs(os.path.join(self.root, "cmd"))
+        for p in (("usr", "bin", "bash.exe"), ("bin", "bash.exe"),
+                  ("cmd", "git.exe")):
+            open(os.path.join(self.root, *p), "w").close()
+
+    def _root_from(self, bash=None, git=None, env=None):
+        guard._msys_root_cached = ()
+        with mock.patch.object(guard.shutil, "which",
+                               side_effect=lambda n: {"bash": bash, "git": git}.get(n)), \
+                mock.patch.dict(os.environ,
+                                {"CLAUDE_CODE_GIT_BASH_PATH": env} if env else {},
+                                clear=False):
+            if not env:
+                os.environ.pop("CLAUDE_CODE_GIT_BASH_PATH", None)
+            return guard.msys_root()
+
+    def test_found_from_each_candidate_depth(self):
+        # bin/bash.exe, usr/bin/bash.exe and cmd/git.exe sit at different
+        # depths; the ancestor walk lands on the same root from all three.
+        self.assertEqual(
+            self._root_from(bash=os.path.join(self.root, "bin", "bash.exe")),
+            self.root)
+        self.assertEqual(
+            self._root_from(bash=os.path.join(self.root, "usr", "bin", "bash.exe")),
+            self.root)
+        self.assertEqual(
+            self._root_from(git=os.path.join(self.root, "cmd", "git.exe")),
+            self.root)
+
+    def test_explicit_git_bash_path_wins(self):
+        self.assertEqual(
+            self._root_from(env=os.path.join(self.root, "bin", "bash.exe")),
+            self.root)
+
+    def test_marker_rejects_a_non_msys_bash(self):
+        # The WSL launcher's shape: no usr/bin/bash.exe anywhere above it.
+        wsl = os.path.join(self._tmp.name, "Windows", "System32")
+        os.makedirs(wsl)
+        open(os.path.join(wsl, "bash.exe"), "w").close()
+        self.assertIsNone(self._root_from(bash=os.path.join(wsl, "bash.exe")))
+
+    def test_no_bash_at_all(self):
+        self.assertIsNone(self._root_from())
+
+    def test_result_is_cached(self):
+        first = self._root_from(bash=os.path.join(self.root, "bin", "bash.exe"))
+        self.assertEqual(first, self.root)
+        # A second call must not re-scan PATH: which() raising proves it didn't.
+        with mock.patch.object(guard.shutil, "which",
+                               side_effect=AssertionError("re-scanned PATH")):
+            self.assertEqual(guard.msys_root(), self.root)
 
 
 def run_hook(cmd, cwd, project_dir=None, permission_mode=None, session_id=None,
@@ -1302,7 +1556,7 @@ class HookEndToEndTests(unittest.TestCase):
         # resolve against the new cwd and spuriously flag. Reading an absolute
         # in-workspace file should stay allow despite the cd.
         abs_in = os.path.join(self.workspace, "in.txt")
-        self._decision(f"cd /tmp/q20-fake-dir && grep PAT {abs_in} 2>&1", "allow")
+        self._decision(f"cd /tmp/q20-fake-dir && grep PAT {sh(abs_in)} 2>&1", "allow")
 
     def test_fd_prefixed_redirect_to_outside_still_ask(self):
         # Dropping the fd digit must not drop the redirect target itself.
@@ -1351,13 +1605,13 @@ class HookEndToEndTests(unittest.TestCase):
         # only the redirect routing is under test.
         os.mkdir(os.path.join(self.workspace, "sub"))
         abs_in = os.path.join(self.workspace, "in.txt")
-        self._decision(f"cd sub && cat {abs_in} > out.txt", "allow")
+        self._decision(f"cd sub && cat {sh(abs_in)} > out.txt", "allow")
 
     def test_fd_prefixed_redirect_target_tracks_cd_outside_ask(self):
         # fd-prefix popping must route the surviving target into the post-cd
         # group: `2>err.log` after `cd /etc` writes /etc/err.log (outside).
         abs_in = os.path.join(self.workspace, "in.txt")
-        out = self._decision(f"cd /etc && grep PAT {abs_in} 2>err.log", "ask")
+        out = self._decision(f"cd /etc && grep PAT {sh(abs_in)} 2>err.log", "ask")
         self.assertIn(
             "err.log",
             out["hookSpecificOutput"]["permissionDecisionReason"],
@@ -1367,7 +1621,7 @@ class HookEndToEndTests(unittest.TestCase):
         # `>&file` (DUP operator, target is a filename not an fd) routes into
         # the post-cd group too: /etc/dup.out is outside.
         abs_in = os.path.join(self.workspace, "in.txt")
-        out = self._decision(f"cd /etc && grep PAT {abs_in} >&dup.out", "ask")
+        out = self._decision(f"cd /etc && grep PAT {sh(abs_in)} >&dup.out", "ask")
         self.assertIn(
             "dup.out",
             out["hookSpecificOutput"]["permissionDecisionReason"],
@@ -1378,7 +1632,7 @@ class HookEndToEndTests(unittest.TestCase):
         # must stay skipped even after a cd, so a path-like here-string body
         # doesn't spuriously flag. Absolute in-workspace source stays allow.
         abs_in = os.path.join(self.workspace, "in.txt")
-        self._decision(f'cd /tmp && cat {abs_in} <<<"/etc/foo"', "allow")
+        self._decision(f'cd /tmp && cat {sh(abs_in)} <<<"/etc/foo"', "allow")
 
     def test_top_level_redirect_still_outside_ask(self):
         # Regression: a top-level (no-cd) absolute redirect target is still
@@ -1429,25 +1683,28 @@ class HookEndToEndTests(unittest.TestCase):
         self._decision("cat foo~bak", "allow")
 
     def test_tilde_path_into_workspace_allow(self):
-        # Q19: when the project lives under $HOME, `~/<rel>/in.txt` expands to
-        # an in-workspace path and should allow (previously a spurious ask).
-        home = os.environ["HOME"]
+        # Q19: when the project lives under the home directory, `~/<rel>/in.txt`
+        # expands to an in-workspace path and should allow (previously a
+        # spurious ask).
+        home = guard.resolved_home()                      # Q43: not $HOME
+        self.assertIsNotNone(home, "no home directory resolves")
         with tempfile.TemporaryDirectory(dir=home) as ws:
             ws = os.path.realpath(ws)
             with open(os.path.join(ws, "in.txt"), "w") as f:
                 f.write("hi\n")
-            rel = os.path.relpath(ws, home)            # e.g. "tmpXXXX"
+            rel = home_rel(ws, home)                       # e.g. "tmpXXXX"
             self._decision(f"cat ~/{rel}/in.txt", "allow", cwd=ws)
 
     def test_cd_tilde_into_workspace_relative_allow(self):
-        # `cd ~/<rel> && cat in.txt` — cd tracks through the expanded $HOME
+        # `cd ~/<rel> && cat in.txt` — cd tracks through the expanded home
         # path, so the subsequent relative read resolves in-workspace.
-        home = os.environ["HOME"]
+        home = guard.resolved_home()                      # Q43: not $HOME
+        self.assertIsNotNone(home, "no home directory resolves")
         with tempfile.TemporaryDirectory(dir=home) as ws:
             ws = os.path.realpath(ws)
             with open(os.path.join(ws, "in.txt"), "w") as f:
                 f.write("hi\n")
-            rel = os.path.relpath(ws, home)
+            rel = home_rel(ws, home)
             self._decision(f"cd ~/{rel} && cat in.txt", "allow", cwd=ws)
 
     # --- cd / pushd / popd shift cwd (Q7) -----------------------------------
@@ -1489,7 +1746,7 @@ class HookEndToEndTests(unittest.TestCase):
         os.mkdir(nested)
         with open(os.path.join(nested, "x.txt"), "w") as f:
             f.write("hi\n")
-        self._decision(f"cd {nested} && cat x.txt", "allow")
+        self._decision(f"cd {sh(nested)} && cat x.txt", "allow")
 
     def test_popd_taints_subsequent_relative_outside_ask(self):
         # popd's effect can't be tracked; any subsequent relative path in a
@@ -1531,7 +1788,8 @@ class HookEndToEndTests(unittest.TestCase):
         out = self._decision("cd /q85-fake-outside && cat notes.txt", "ask")
         reason = out["hookSpecificOutput"]["permissionDecisionReason"]
         self.assertIn("Outside-workspace path(s)", reason)
-        self.assertIn("notes.txt -> /q85-fake-outside/notes.txt", reason)
+        landed = resolved_from(self.workspace, "/q85-fake-outside", "notes.txt")
+        self.assertIn("notes.txt -> %s" % landed, reason)
         self.assertNotIn("untracked", reason)
 
     def test_cd_outside_literal_redirect_names_absolute_path(self):
@@ -1540,7 +1798,8 @@ class HookEndToEndTests(unittest.TestCase):
         out = self._decision(
             "cd /q85-fake-outside && cat in.txt > out.log", "ask")
         reason = out["hookSpecificOutput"]["permissionDecisionReason"]
-        self.assertIn("out.log -> /q85-fake-outside/out.log", reason)
+        landed = resolved_from(self.workspace, "/q85-fake-outside", "out.log")
+        self.assertIn("out.log -> %s" % landed, reason)
         self.assertNotIn("untracked", reason)
 
     def test_cd_only_command_defers(self):
@@ -1557,9 +1816,14 @@ class HookEndToEndTests(unittest.TestCase):
         self.assertNotIn("in.txt", reason)
 
     def test_classify_cd_helper_arg(self):
-        self.assertEqual(guard.classify_cd(["cd", "/etc"]), ("arg", "/etc"))
-        self.assertEqual(guard.classify_cd(["pushd", "/tmp"]), ("arg", "/tmp"))
-        self.assertEqual(guard.classify_cd(["cd", "-L", "/etc"]), ("arg", "/etc"))
+        # The target comes back read the way the shell will read it, so on
+        # Windows `/etc` is already the mount-table path (Q52); elsewhere
+        # msys_to_native is the identity and these are the literals.
+        for tokens, target in ((["cd", "/etc"], "/etc"),
+                               (["pushd", "/tmp"], "/tmp"),
+                               (["cd", "-L", "/etc"], "/etc")):
+            self.assertEqual(guard.classify_cd(tokens),
+                             ("arg", guard.msys_to_native(target)))
 
     def test_classify_cd_helper_unknown(self):
         self.assertEqual(guard.classify_cd(["cd"]), ("unknown", None))
@@ -1575,9 +1839,10 @@ class HookEndToEndTests(unittest.TestCase):
         self.assertEqual(guard.classify_cd(["popd", "+0"]), ("unknown", None))
 
     def test_classify_cd_helper_expands_tilde(self):
-        # Q19: bare `~` and `~/…` expand to $HOME deterministically, so cd
-        # tracking follows them instead of dropping to ('unknown', None).
-        home = os.environ["HOME"]
+        # Q19: bare `~` and `~/…` expand to the home directory deterministically,
+        # so cd tracking follows them instead of dropping to ('unknown', None).
+        home = guard.resolved_home()                      # Q43: not $HOME
+        self.assertIsNotNone(home, "no home directory resolves")
         self.assertEqual(guard.classify_cd(["cd", "~"]), ("arg", home))
         self.assertEqual(
             guard.classify_cd(["cd", "~/foo"]),
@@ -1747,7 +2012,7 @@ class HookEndToEndTests(unittest.TestCase):
             outside = os.path.realpath(d)
             os.mkdir(os.path.join(outside, ".git"))
             out = run_hook(
-                f'cd {outside} && cd "$(git rev-parse --show-toplevel)" '
+                f'cd {sh(outside)} && cd "$(git rev-parse --show-toplevel)" '
                 "&& cat data.txt",
                 self.workspace,
             )
@@ -2390,18 +2655,18 @@ class HookEndToEndTests(unittest.TestCase):
 
     def test_claude_session_tmp_read_allow(self):
         sess = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
-        self._decision(f"cat {self._session_tmp(sess)}", "allow",
+        self._decision(f"cat {sh(self._session_tmp(sess))}", "allow",
                        session_id=sess)
 
     def test_claude_session_tmp_tail_allow(self):
         sess = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
-        self._decision(f"tail -20 {self._session_tmp(sess)}", "allow",
+        self._decision(f"tail -20 {sh(self._session_tmp(sess))}", "allow",
                        session_id=sess)
 
     def test_claude_session_tmp_redirect_target_allow(self):
         # Writing into the current session's scratch via a redirect is allowed.
         sess = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
-        self._decision(f"cat in.txt > {self._session_tmp(sess, 'log')}",
+        self._decision(f"cat in.txt > {sh(self._session_tmp(sess, 'log'))}",
                        "allow", session_id=sess)
 
     def test_claude_other_session_tmp_ask(self):
@@ -2409,7 +2674,7 @@ class HookEndToEndTests(unittest.TestCase):
         # the cross-session leak the per-session scope prevents.
         owner = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
         current = "ffffffff-0000-1111-2222-333333333333"
-        out = self._decision(f"cat {self._session_tmp(owner)}", "ask",
+        out = self._decision(f"cat {sh(self._session_tmp(owner))}", "ask",
                              session_id=current)
         self.assertIn(self._session_tmp(owner),
                       out["hookSpecificOutput"]["permissionDecisionReason"])
@@ -2417,7 +2682,7 @@ class HookEndToEndTests(unittest.TestCase):
     def test_claude_tmp_without_session_id_ask(self):
         # No session_id field (older CLI) -> allow disabled -> still prompts.
         sess = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
-        self._decision(f"cat {self._session_tmp(sess)}", "ask")
+        self._decision(f"cat {sh(self._session_tmp(sess))}", "ask")
 
     def test_claude_session_tmp_symlink_escape_still_ask(self):
         # Defense-in-depth: an `ln` staging an OUTSIDE target to a link that
@@ -2426,7 +2691,7 @@ class HookEndToEndTests(unittest.TestCase):
         sess = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
         link = self._session_tmp(sess, "link")
         out = self._decision(
-            f"ln -s /tmp/q21-fake-target {link} && cat {link}", "ask",
+            f"ln -s /tmp/q21-fake-target {sh(link)} && cat {sh(link)}", "ask",
             session_id=sess)
         self.assertIn(link,
                       out["hookSpecificOutput"]["permissionDecisionReason"])
@@ -2438,58 +2703,64 @@ class HookEndToEndTests(unittest.TestCase):
     # exist — the hook resolves lexically). Write commands must still prompt.
 
     def _claude_projects_path(self, *parts):
-        """Return a synthetic path under ~/.claude/projects/."""
+        """Return a synthetic path under ~/.claude/projects/.
+
+        Plain, like every other path helper here — callers quote it with ``sh()``
+        at the point of interpolation. Quoting inside the helper too would double
+        it, and the doubled token parses back as a filename that literally
+        contains quote characters.
+        """
         cpd = guard.claude_projects_dir()
         if cpd is None:
-            self.skipTest("HOME not set, skipping ~/.claude/projects/ tests")
+            self.skipTest("home not resolvable, skipping ~/.claude/projects/ tests")
         return os.path.join(cpd, *parts)
 
     def test_cat_claude_projects_allow(self):
         # Reading a workflow journal under ~/.claude/projects/ is allowed.
         target = self._claude_projects_path(
             "-Users-me-proj", "wf_abc123", "journal.jsonl")
-        self._decision(f"cat {target}", "allow")
+        self._decision(f"cat {sh(target)}", "allow")
 
     def test_grep_claude_projects_allow(self):
         target = self._claude_projects_path(
             "-Users-me-proj", "subagents", "data.json")
-        self._decision(f"grep 'key' {target}", "allow")
+        self._decision(f"grep 'key' {sh(target)}", "allow")
 
     def test_head_claude_projects_allow(self):
         target = self._claude_projects_path(
             "-Users-me-proj", "wf_abc123", "journal.jsonl")
-        self._decision(f"head -20 {target}", "allow")
+        self._decision(f"head -20 {sh(target)}", "allow")
 
     def test_tail_claude_projects_allow(self):
         target = self._claude_projects_path(
             "-Users-me-proj", "wf_abc123", "journal.jsonl")
-        self._decision(f"tail -f {target}", "allow")
+        self._decision(f"tail -f {sh(target)}", "allow")
 
     def test_cp_from_claude_projects_ask(self):
         # cp reads source and writes dest — write command; prefix exemption
         # does NOT apply even when the source is under ~/.claude/projects/.
         target = self._claude_projects_path(
             "-Users-me-proj", "wf_abc123", "journal.jsonl")
-        self._decision(f"cp {target} ./local-copy.jsonl", "ask")
+        self._decision(f"cp {sh(target)} ./local-copy.jsonl", "ask")
 
     def test_cp_to_claude_projects_ask(self):
         # Writing into ~/.claude/projects/ is also not exempt.
         target = self._claude_projects_path(
             "-Users-me-proj", "wf_abc123", "out.txt")
-        self._decision(f"cp ./in.txt {target}", "ask")
+        self._decision(f"cp ./in.txt {sh(target)}", "ask")
 
     def test_rm_claude_projects_ask(self):
         # Deletion is a write command; exemption does not apply.
         target = self._claude_projects_path(
             "-Users-me-proj", "wf_abc123", "journal.jsonl")
-        self._decision(f"rm {target}", "ask")
+        self._decision(f"rm {sh(target)}", "ask")
 
     def test_redirect_to_claude_projects_ask(self):
         # A redirect target is conservative (is_read=False) even for
         # allowed prefixes — the hook can't verify the redirect direction.
         target = self._claude_projects_path(
             "-Users-me-proj", "wf_abc123", "out.txt")
-        self._decision(f"cat in.txt > {target}", "ask")
+        self._decision(f"cat in.txt > {sh(target)}", "ask")
 
     def test_sed_inplace_claude_projects_ask(self):
         # Q36: `sed -i` mutates its file operand — write mode; the read
@@ -2497,39 +2768,39 @@ class HookEndToEndTests(unittest.TestCase):
         # context, so a silent in-place write is an injection vector).
         target = self._claude_projects_path(
             "-Users-me-proj", "memory", "MEMORY.md")
-        self._decision(f"sed -i 's/a/b/' {target}", "ask")
+        self._decision(f"sed -i 's/a/b/' {sh(target)}", "ask")
 
     def test_sed_inplace_cluster_claude_projects_ask(self):
         # `-ni` cluster: the `i` inside a short-option run still counts.
         target = self._claude_projects_path(
             "-Users-me-proj", "memory", "MEMORY.md")
-        self._decision(f"sed -ni 's/a/b/p' {target}", "ask")
+        self._decision(f"sed -ni 's/a/b/p' {sh(target)}", "ask")
 
     def test_sed_read_only_claude_projects_allow(self):
         # Plain sed (no -i) stays a read — exemption applies.
         target = self._claude_projects_path(
             "-Users-me-proj", "memory", "MEMORY.md")
-        self._decision(f"sed -n '1,10p' {target}", "allow")
+        self._decision(f"sed -n '1,10p' {sh(target)}", "allow")
 
     def test_awk_inplace_claude_projects_ask(self):
         target = self._claude_projects_path(
             "-Users-me-proj", "memory", "MEMORY.md")
-        self._decision(f"awk -i inplace '{{print}}' {target}", "ask")
+        self._decision(f"awk -i inplace '{{print}}' {sh(target)}", "ask")
 
     def test_yq_inplace_claude_projects_ask(self):
         target = self._claude_projects_path(
             "-Users-me-proj", "wf_abc123", "data.yaml")
-        self._decision(f"yq -i '.a = 1' {target}", "ask")
+        self._decision(f"yq -i '.a = 1' {sh(target)}", "ask")
 
     def test_sort_output_claude_projects_ask(self):
         target = self._claude_projects_path(
             "-Users-me-proj", "wf_abc123", "out.txt")
-        self._decision(f"sort -o {target} ./in.txt", "ask")
+        self._decision(f"sort -o {sh(target)} ./in.txt", "ask")
 
     def test_sort_read_claude_projects_allow(self):
         target = self._claude_projects_path(
             "-Users-me-proj", "wf_abc123", "journal.jsonl")
-        self._decision(f"sort {target}", "allow")
+        self._decision(f"sort {sh(target)}", "allow")
 
     def test_sed_inplace_workspace_allow(self):
         # Write-mode detection only disables the exemption; in-workspace
@@ -2541,44 +2812,44 @@ class HookEndToEndTests(unittest.TestCase):
         # exemption must not apply to the output even under the read prefix.
         target = self._claude_projects_path(
             "-Users-me-proj", "wf_abc123", "out.txt")
-        self._decision(f"uniq ./in.txt {target}", "ask")
+        self._decision(f"uniq ./in.txt {sh(target)}", "ask")
 
     def test_uniq_read_claude_projects_allow(self):
         # Single operand is a pure read — exemption still applies.
         target = self._claude_projects_path(
             "-Users-me-proj", "wf_abc123", "journal.jsonl")
-        self._decision(f"uniq {target}", "allow")
+        self._decision(f"uniq {sh(target)}", "allow")
 
     def test_uniq_exempt_input_workspace_output_allow(self):
         # Per-operand classification: the input keeps the read exemption
         # while the in-workspace output is fine — no prompt.
         target = self._claude_projects_path(
             "-Users-me-proj", "wf_abc123", "journal.jsonl")
-        self._decision(f"uniq {target} ./deduped.txt", "allow")
+        self._decision(f"uniq {sh(target)} ./deduped.txt", "allow")
 
     def test_uniq_flag_value_not_an_output_allow(self):
         # `-f 1` is consumed as a field count; with the old cat alias it
         # became a positional and shifted the operand indices.
         target = self._claude_projects_path(
             "-Users-me-proj", "wf_abc123", "journal.jsonl")
-        self._decision(f"uniq -f 1 {target}", "allow")
+        self._decision(f"uniq -f 1 {sh(target)}", "allow")
 
     def test_xxd_output_claude_projects_ask(self):
         target = self._claude_projects_path(
             "-Users-me-proj", "wf_abc123", "dump.hex")
-        self._decision(f"xxd ./in.bin {target}", "ask")
+        self._decision(f"xxd ./in.bin {sh(target)}", "ask")
 
     def test_xxd_reverse_output_claude_projects_ask(self):
         # `xxd -r IN OUT` also writes the second positional; `-s 0x10` is
         # consumed so the operand indices stay aligned.
         target = self._claude_projects_path(
             "-Users-me-proj", "wf_abc123", "rebuilt.bin")
-        self._decision(f"xxd -r -s 0x10 ./dump.hex {target}", "ask")
+        self._decision(f"xxd -r -s 0x10 ./dump.hex {sh(target)}", "ask")
 
     def test_xxd_read_claude_projects_allow(self):
         target = self._claude_projects_path(
             "-Users-me-proj", "wf_abc123", "journal.jsonl")
-        self._decision(f"xxd -l 64 {target}", "allow")
+        self._decision(f"xxd -l 64 {sh(target)}", "allow")
 
     def test_uniq_output_workspace_allow(self):
         # Both operands in-workspace: unaffected by the write classification.
@@ -2589,7 +2860,7 @@ class HookEndToEndTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             td = os.path.realpath(td)
             target = os.path.join(td, "safe-data.json")
-            out = run_hook(f"cat {target}", self.workspace,
+            out = run_hook(f"cat {sh(target)}", self.workspace,
                            env_extra={"WORKSPACE_GUARD_READ_ALLOW_PREFIXES": td})
             self.assertIsNotNone(out)
             self.assertEqual(out["hookSpecificOutput"]["permissionDecision"], "allow")
@@ -2599,7 +2870,7 @@ class HookEndToEndTests(unittest.TestCase):
         # Use a synthetic path outside /tmp to avoid the host-temp deny path.
         fake_prefix = "/var/fake-read-allow-test"
         target = fake_prefix + "/safe-data.json"
-        out = run_hook(f"cp ./in.txt {target}", self.workspace,
+        out = run_hook(f"cp ./in.txt {sh(target)}", self.workspace,
                        env_extra={"WORKSPACE_GUARD_READ_ALLOW_PREFIXES": fake_prefix})
         self.assertIsNotNone(out)
         self.assertEqual(out["hookSpecificOutput"]["permissionDecision"], "ask")
@@ -3269,6 +3540,58 @@ class StripHeredocBodiesTests(unittest.TestCase):
             guard.strip_heredoc_bodies("grep PAT f.txt\ncat g.txt"),
             "grep PAT f.txt\ncat g.txt")
 
+    # --- expanded: hand back the bodies bash expands (Q35, Q50) --------------
+
+    def collect(self, cmd):
+        """(stripped command, bodies bash would expand) for `cmd`."""
+        expanded = []
+        return guard.strip_heredoc_bodies(cmd, expanded=expanded), expanded
+
+    def test_expanded_skips_single_quoted_delimiter_body(self):
+        self.assertEqual(
+            self.collect("cat <<'EOF'\n$(id)\nEOF"), ("cat <<'EOF'\n", []))
+
+    def test_expanded_skips_double_quoted_delimiter_body(self):
+        self.assertEqual(
+            self.collect('cat <<"EOF"\n$(id)\nEOF'), ('cat <<"EOF"\n', []))
+
+    def test_expanded_skips_backslash_delimiter_body(self):
+        # `<<\EOF` is quoting too — bash leaves the body literal.
+        self.assertEqual(
+            self.collect("cat <<\\EOF\n$(id)\nEOF"), ("cat <<\\EOF\n", []))
+
+    def test_expanded_collects_unquoted_delimiter_body(self):
+        self.assertEqual(
+            self.collect("cat <<EOF\n$(id)\nEOF"),
+            ("cat <<EOF\n", ["$(id)\nEOF"]))
+
+    def test_expanded_skips_partially_quoted_delimiter_body(self):
+        # `<<E'O'F` — any quoting in the word makes the whole delimiter quoted.
+        self.assertEqual(
+            self.collect("cat <<E'O'F\n$(id)\nEOF"), ("cat <<E'O'F\n", []))
+
+    def test_expanded_mixed_delimiters_collect_only_unquoted(self):
+        self.assertEqual(
+            self.collect("cat <<'A' <<B\naaa\nA\nbbb\nB"),
+            ("cat <<'A' <<B\n", ["bbb\nB"]))
+
+    def test_expanded_command_after_collected_body_survives(self):
+        self.assertEqual(
+            self.collect("cat <<EOF\nbody\nEOF\ncat x"),
+            ("cat <<EOF\ncat x", ["body\nEOF\n"]))
+
+    def test_expanded_unterminated_body(self):
+        self.assertEqual(
+            self.collect("cat <<EOF\nbody line\nno terminator"),
+            ("cat <<EOF\n", ["body line\nno terminator"]))
+
+    def test_expanded_omitted_still_strips(self):
+        # Q50: the body never stays in the returned string, so an odd quote in
+        # it cannot color the scan of what follows.
+        self.assertEqual(
+            guard.strip_heredoc_bodies("cat <<EOF\ndon't\nEOF\ncat x"),
+            "cat <<EOF\ncat x")
+
 
 class GlueDollarParenTests(unittest.TestCase):
     """`glue_dollar_paren` re-attaches `(` to a preceding `$` so `$(...)`
@@ -3351,6 +3674,35 @@ class CommandSubstitutionsTests(unittest.TestCase):
 
     def test_no_substitution(self):
         self.assertEqual(guard.command_substitutions("cat foo bar"), [])
+
+    # --- quotes=False: how bash reads a heredoc body (Q50) -------------------
+
+    def test_quotes_off_apostrophe_does_not_hide_substitution(self):
+        self.assertEqual(
+            guard.command_substitutions("don't $(cat f)", quotes=False),
+            ["cat f"])
+
+    def test_quotes_off_single_quoted_substitution_is_live(self):
+        self.assertEqual(
+            guard.command_substitutions("'$(cat f)'", quotes=False), ["cat f"])
+
+    def test_quotes_off_odd_double_quote_does_not_hide_substitution(self):
+        self.assertEqual(
+            guard.command_substitutions('say "hi $(cat f)', quotes=False),
+            ["cat f"])
+
+    def test_quotes_off_backslash_still_escapes(self):
+        self.assertEqual(
+            guard.command_substitutions(r"don't \$(cat f)", quotes=False), [])
+
+    def test_quotes_off_backtick_still_found(self):
+        self.assertEqual(
+            guard.command_substitutions("don't `cat f`", quotes=False),
+            ["cat f"])
+
+    def test_quotes_off_arithmetic_still_skipped(self):
+        self.assertEqual(
+            guard.command_substitutions("don't $((1 + 2))", quotes=False), [])
 
 
 class QuotedSubstBodyEndToEndTests(unittest.TestCase):
@@ -3595,6 +3947,67 @@ class Issue83HeredocEndToEndTests(unittest.TestCase):
         self._decision(
             "cat <<A <<B\naaa\nA\nbbb\nB\ncat /etc/q83-fake", "ask")
 
+    # --- `$(…)` in a body: expanded only under an unquoted delimiter (Q35) ---
+
+    def test_substitution_in_quoted_delimiter_body_allow(self):
+        # A quoted delimiter makes the body literal text, so the `$(…)` never
+        # runs — flagging its outside read was a spurious prompt.
+        self._decision(
+            "cat > doc.md <<'EOF'\nrun $(cat /etc/q35-fake) to see\nEOF", "allow")
+
+    def test_substitution_in_backslash_delimiter_body_allow(self):
+        self._decision(
+            "cat > doc.md <<\\EOF\nrun $(cat /etc/q35-fake)\nEOF", "allow")
+
+    def test_substitution_in_unquoted_delimiter_body_ask(self):
+        # No quoting: bash expands the body, so the read is real.
+        out = self._decision(
+            "cat > doc.md <<EOF\nrun $(cat /etc/q35-fake)\nEOF", "ask")
+        self.assertIn("/etc/q35-fake",
+                      out["hookSpecificOutput"]["permissionDecisionReason"])
+
+    def test_backtick_in_quoted_delimiter_body_allow(self):
+        self._decision(
+            "cat > doc.md <<'EOF'\nrun `cat /etc/q35-fake`\nEOF", "allow")
+
+    def test_substitution_on_quoted_heredoc_command_line_still_ask(self):
+        # Only the BODY is literal; the command line around it still expands.
+        self._decision(
+            "cat > \"$(cat /etc/q35-fake)\" <<'EOF'\nplain\nEOF", "ask")
+
+    def test_substitution_after_quoted_heredoc_still_ask(self):
+        self._decision(
+            "cat <<'EOF'\n$(true)\nEOF\necho $(cat /etc/q35-fake)", "ask")
+
+    # --- an odd quote in an expanded body colors nothing (Q50) --------------
+
+    def test_apostrophe_before_substitution_in_body_ask(self):
+        # A heredoc body carries no quoting, so the `'` in `don't` is text. Read
+        # inline it opened a quoted run that swallowed the live `$(…)` after it.
+        out = self._decision(
+            "cat > doc.md <<EOF\ndon't run $(cat /etc/q50-fake)\nEOF", "ask")
+        self.assertIn("/etc/q50-fake",
+                      out["hookSpecificOutput"]["permissionDecisionReason"])
+
+    def test_apostrophe_in_body_then_substitution_on_later_line_ask(self):
+        # The body's odd quote must not reach the command line that follows it.
+        self._decision(
+            "cat <<EOF\ndon't\nEOF\necho $(cat /etc/q50-fake)", "ask")
+
+    def test_odd_double_quote_before_substitution_in_body_ask(self):
+        self._decision(
+            'cat <<EOF\nsay "hi\n$(cat /etc/q50-fake)\nEOF', "ask")
+
+    def test_apostrophe_before_backtick_in_body_ask(self):
+        self._decision(
+            "cat <<EOF\ndon't\n`cat /etc/q50-fake`\nEOF", "ask")
+
+    def test_escaped_substitution_in_body_after_apostrophe_allow(self):
+        # `\$(` is quoted even in a body — bash writes it literally, so the
+        # quote-inert scan must still honour the backslash.
+        self._decision(
+            "cat > doc.md <<EOF\ndon't run \\$(cat /etc/q50-fake)\nEOF", "allow")
+
 
 class OffenderDisplayTests(unittest.TestCase):
     """Relative offender tokens are shown with their resolved landing path."""
@@ -3605,9 +4018,11 @@ class OffenderDisplayTests(unittest.TestCase):
             "notes.txt -> /outside/notes.txt")
 
     def test_absolute_token_unchanged(self):
-        self.assertEqual(
-            guard.offender_display("/outside/notes.txt", "/outside/notes.txt"),
-            "/outside/notes.txt")
+        # A leading slash is drive-relative on Windows, not absolute, so the
+        # token has to be fully qualified for this branch to be the one under
+        # test — resolving it is how the caller gets there anyway.
+        tok = resolved_from(os.getcwd(), "/outside/notes.txt")
+        self.assertEqual(guard.offender_display(tok, tok), tok)
 
 
 class BuildReasonTests(unittest.TestCase):
@@ -3696,9 +4111,10 @@ class ReasonAdviceEndToEndTests(unittest.TestCase):
         self.assertIn("same check", r)
 
     def test_tilde_home_token_reason_uses_outside_advice(self):
-        # Q19: `~/…` now expands to $HOME, which is outside this tempdir
-        # workspace, so the offender lands in the 'outside' bucket (not
+        # Q19: `~/…` now expands to the home directory, which is outside this
+        # tempdir workspace, so the offender lands in the 'outside' bucket (not
         # 'expand') and gets the outside-path advice.
+        self.assertIsNotNone(guard.resolved_home(), "no home directory resolves")
         r = self._reason("cat ~/.ssh/id_rsa")
         self.assertIn("~/.ssh/id_rsa", r)
         self.assertIn("same check", r)
@@ -3725,50 +4141,64 @@ class HostTempHelperTests(unittest.TestCase):
     """Unit coverage for the host-temp classification helpers."""
 
     def test_path_at_or_under_boundary(self):
-        self.assertTrue(guard.path_at_or_under("/tmp", "/tmp"))
-        self.assertTrue(guard.path_at_or_under("/tmp/x", "/tmp"))
-        self.assertTrue(guard.path_at_or_under("/tmp/a/b", "/tmp"))
+        # Callers pass realpaths, which carry the platform separator.
+        self.assertTrue(guard.path_at_or_under(native("/tmp"), native("/tmp")))
+        self.assertTrue(guard.path_at_or_under(native("/tmp/x"), native("/tmp")))
+        self.assertTrue(guard.path_at_or_under(native("/tmp/a/b"), native("/tmp")))
         # Sibling lookalikes must NOT match (the os.sep boundary).
-        self.assertFalse(guard.path_at_or_under("/tmpfoo", "/tmp"))
-        self.assertFalse(guard.path_at_or_under("/tmpfs/x", "/tmp"))
-        self.assertFalse(guard.path_at_or_under("/var/tmpx", "/var/tmp"))
+        self.assertFalse(guard.path_at_or_under(native("/tmpfoo"), native("/tmp")))
+        self.assertFalse(guard.path_at_or_under(native("/tmpfs/x"), native("/tmp")))
+        self.assertFalse(
+            guard.path_at_or_under(native("/var/tmpx"), native("/var/tmp")))
 
     def test_is_host_temp_with_explicit_roots(self):
-        roots = {"/tmp", "/var/tmp"}
-        self.assertTrue(guard.is_host_temp("/tmp/out", roots))
-        self.assertTrue(guard.is_host_temp("/var/tmp/x", roots))
-        self.assertFalse(guard.is_host_temp("/etc/passwd", roots))
-        self.assertFalse(guard.is_host_temp("/tmpfoo/x", roots))
+        roots = {native("/tmp"), native("/var/tmp")}
+        self.assertTrue(guard.is_host_temp(native("/tmp/out"), roots))
+        self.assertTrue(guard.is_host_temp(native("/var/tmp/x"), roots))
+        self.assertFalse(guard.is_host_temp(native("/etc/passwd"), roots))
+        self.assertFalse(guard.is_host_temp(native("/tmpfoo/x"), roots))
 
     def test_split_pathlist_colon_and_comma(self):
+        # `:` is the POSIX list separator but part of a Windows drive letter,
+        # so the split is on os.pathsep — `;` there — plus a comma everywhere.
         self.assertEqual(
-            guard._split_pathlist("/a:/b,/c"), ["/a", "/b", "/c"])
+            guard._split_pathlist("/a%s/b,/c" % os.pathsep), ["/a", "/b", "/c"])
         self.assertEqual(guard._split_pathlist(""), [])
         self.assertEqual(guard._split_pathlist("  /a , , /b "), ["/a", "/b"])
 
     def test_matches_allowlist_exact_and_prefix(self):
         # Callers always pass an already-resolved realpath, so mirror that
         # (on macOS /tmp/ok -> /private/tmp/ok); the pattern stays user-written.
-        ok = os.path.realpath("/tmp/ok")
-        self.assertTrue(guard.matches_allowlist(ok, ["/tmp/ok"]))
-        self.assertTrue(guard.matches_allowlist(os.path.join(ok, "x"), ["/tmp/ok"]))
-        self.assertFalse(
-            guard.matches_allowlist(os.path.realpath("/tmp/nope"), ["/tmp/ok"]))
-        self.assertFalse(guard.matches_allowlist(ok, []))
+        base = os.getcwd()
+        ok = resolved_from(base, "/tmp/ok")
+        self.assertTrue(guard.matches_allowlist(ok, ["/tmp/ok"], base))
+        self.assertTrue(
+            guard.matches_allowlist(os.path.join(ok, "x"), ["/tmp/ok"], base))
+        self.assertFalse(guard.matches_allowlist(
+            resolved_from(base, "/tmp/nope"), ["/tmp/ok"], base))
+        self.assertFalse(guard.matches_allowlist(ok, [], base))
 
     def test_matches_allowlist_glob(self):
         # The resolved realpath (possibly /private-prefixed on macOS) still
         # matches a user-written /tmp glob.
+        base = os.getcwd()
         self.assertTrue(guard.matches_allowlist(
-            os.path.realpath("/tmp/build-123"), ["/tmp/build-*"]))
+            resolved_from(base, "/tmp/build-123"), ["/tmp/build-*"], base))
         self.assertFalse(guard.matches_allowlist(
-            os.path.realpath("/tmp/other"), ["/tmp/build-*"]))
+            resolved_from(base, "/tmp/other"), ["/tmp/build-*"], base))
 
     def test_host_temp_roots_includes_defaults(self):
-        roots = guard.host_temp_roots()
+        roots = guard.host_temp_roots(os.getcwd())
         # Defaults are always present (resolved), regardless of env.
         self.assertIn(os.path.realpath("/tmp"), roots)
         self.assertIn(os.path.realpath("/var/tmp"), roots)
+
+    def test_host_temp_roots_includes_platform_temp_dir(self):
+        # The directory this tier exists to catch. On POSIX it is
+        # $TMPDIR-or-/tmp and already among the defaults; on Windows it is
+        # %TMP%, which the POSIX names miss entirely.
+        roots = guard.host_temp_roots(os.getcwd())
+        self.assertIn(os.path.realpath(tempfile.gettempdir()), roots)
 
     def test_build_scratch_hint_present_vs_absent(self):
         with tempfile.TemporaryDirectory() as proj:
@@ -3848,7 +4278,7 @@ class HostTempDenyTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             tmpdir = os.path.realpath(tmpdir)
             target = os.path.join(tmpdir, "session-scratch")
-            self._expect(f"cat {target}", "deny",
+            self._expect(f"cat {sh(target)}", "deny",
                          env_extra={"TMPDIR": tmpdir})
 
     # --- NO-MATCH cases (must NOT deny) -------------------------------------
@@ -3915,7 +4345,7 @@ class HostTempDenyTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as extra:
             extra = os.path.realpath(extra)
             target = os.path.join(extra, "x")
-            self._expect(f"cat {target}", "deny",
+            self._expect(f"cat {sh(target)}", "deny",
                          env_extra={"WORKSPACE_GUARD_TMP_ROOTS": extra})
 
     def test_scratch_dir_name_config_in_reason(self):
@@ -3940,7 +4370,7 @@ class HostTempDenyTests(unittest.TestCase):
         current = "ffffffff-0000-1111-2222-333333333333"
         path = os.path.join(guard.claude_tmp_root(), "-Users-me-proj",
                             owner, "tasks", "abc.output")
-        self._expect(f"cat {path}", "ask", session_id=current)
+        self._expect(f"cat {sh(path)}", "ask", session_id=current)
 
     def test_unguarded_command_to_tmp_still_defers(self):
         # The capability only upgrades paths the hook already extracts. An
@@ -4073,9 +4503,9 @@ class SiblingCheckoutTests(unittest.TestCase):
                               capture_output=True, text=True, check=True)
 
     def setUp(self):
-        home = os.environ.get("HOME")
-        if not home or not os.path.isdir(home):
-            self.skipTest("HOME not set")
+        home = guard.resolved_home()                      # Q43: not $HOME
+        self.assertTrue(home and os.path.isdir(home),
+                        f"no home directory to build the fixture under: {home!r}")
         self._tmp = tempfile.TemporaryDirectory(dir=home)
         self.base = os.path.realpath(self._tmp.name)
         self.main = os.path.join(self.base, "main")
@@ -4185,7 +4615,7 @@ class SiblingCheckoutTests(unittest.TestCase):
 
     def test_bash_redirect_into_primary_deny(self):
         target = os.path.join(self.main, "root.txt")
-        out = self._bash(f"cat /dev/null > {target}")
+        out = self._bash(f"cat /dev/null > {sh(target)}")
         self.assertEqual(self._decision(out), "deny")
         r = self._reason(out)
         self.assertIn("Sibling-checkout", r)
@@ -4196,34 +4626,34 @@ class SiblingCheckoutTests(unittest.TestCase):
 
     def test_bash_cp_into_other_worktree_deny(self):
         target = os.path.join(self.other, "copy.txt")
-        out = self._bash(f"cp root.txt {target}")
+        out = self._bash(f"cp root.txt {sh(target)}")
         self.assertEqual(self._decision(out), "deny")
         self.assertIn("feat-b", self._reason(out))
 
     def test_bash_tee_into_primary_deny(self):
-        out = self._bash(f"echo hi | tee {os.path.join(self.main, 'log.txt')}")
+        out = self._bash(f"echo hi | tee {sh(os.path.join(self.main, 'log.txt'))}")
         self.assertEqual(self._decision(out), "deny")
 
     def test_bash_rm_in_sibling_deny(self):
-        out = self._bash(f"rm -f {os.path.join(self.main, 'root.txt')}")
+        out = self._bash(f"rm -f {sh(os.path.join(self.main, 'root.txt'))}")
         self.assertEqual(self._decision(out), "deny")
 
     # --- Bash: reads keep today's behavior (ask, not deny) ------------------
 
     def test_bash_read_of_sibling_asks_not_deny(self):
-        out = self._bash(f"cat {os.path.join(self.main, 'root.txt')}")
+        out = self._bash(f"cat {sh(os.path.join(self.main, 'root.txt'))}")
         self.assertEqual(self._decision(out), "ask")
         self.assertNotIn("Sibling-checkout", self._reason(out))
 
     def test_bash_grep_of_sibling_asks(self):
-        out = self._bash(f"grep x {os.path.join(self.other, 'root.txt')}")
+        out = self._bash(f"grep x {sh(os.path.join(self.other, 'root.txt'))}")
         self.assertEqual(self._decision(out), "ask")
 
     # --- Bash: override downgrades to ask -----------------------------------
 
     def test_bash_override_downgrades_deny_to_ask(self):
         target = os.path.join(self.main, "root.txt")
-        out = self._bash(f"cat /dev/null > {target}",
+        out = self._bash(f"cat /dev/null > {sh(target)}",
                          env_extra={"WORKSPACE_GUARD_OVERRIDE": "deliberate sync"})
         self.assertEqual(self._decision(out), "ask")
         r = self._reason(out)
@@ -4236,7 +4666,7 @@ class SiblingCheckoutTests(unittest.TestCase):
         # Session is the main checkout (not a worktree): sibling detection is a
         # no-op, so a write into a linked worktree gets the generic outside ask.
         target = os.path.join(self.other, "x.txt")
-        out = self._bash(f"cat /dev/null > {target}",
+        out = self._bash(f"cat /dev/null > {sh(target)}",
                          proj=self.main, cwd=self.main)
         self.assertEqual(self._decision(out), "ask")
         self.assertNotIn("Sibling-checkout", self._reason(out))
@@ -4345,35 +4775,35 @@ class SiblingSessionScratchE2ETests(unittest.TestCase):
 
     def test_sibling_worker_tail_allow(self):
         # The motivating case: a dispatcher tailing a worker's task output.
-        self._expect(f"tail -20 {self._sibling(self.worker)}", "allow",
+        self._expect(f"tail -20 {sh(self._sibling(self.worker))}", "allow",
                      session_id=self.current)
 
     def test_sibling_worker_grep_allow(self):
-        self._expect(f'grep -q "EXIT=" {self._sibling(self.worker)}', "allow",
+        self._expect(f'grep -q "EXIT=" {sh(self._sibling(self.worker))}', "allow",
                      session_id=self.current)
 
     def test_own_session_read_allow(self):
         # Own-session scratch is allowed here too (via the per-session rule).
-        self._expect(f"cat {self._sibling(self.current)}", "allow",
+        self._expect(f"cat {sh(self._sibling(self.current))}", "allow",
                      session_id=self.current)
 
     def test_sibling_worker_cp_write_still_ask(self):
         # Copying INTO a sibling session's scratch is a write -> not exempt.
-        self._expect(f"cp ./in.txt {self._sibling(self.worker)}", "ask",
+        self._expect(f"cp ./in.txt {sh(self._sibling(self.worker))}", "ask",
                      session_id=self.current)
 
     def test_redirect_into_sibling_worker_still_ask(self):
         # Redirect targets pass is_read=False, so they stay guarded.
-        self._expect(f"cat in.txt > {self._sibling(self.worker)}", "ask",
+        self._expect(f"cat in.txt > {sh(self._sibling(self.worker))}", "ask",
                      session_id=self.current)
 
     def test_rm_sibling_worker_still_ask(self):
-        self._expect(f"rm {self._sibling(self.worker)}", "ask",
+        self._expect(f"rm {sh(self._sibling(self.worker))}", "ask",
                      session_id=self.current)
 
     def test_no_session_id_still_ask(self):
         # Without session_id the scan can't anchor -> exemption off -> ask.
-        self._expect(f"tail -20 {self._sibling(self.worker)}", "ask")
+        self._expect(f"tail -20 {sh(self._sibling(self.worker))}", "ask")
 
     def test_cross_project_sibling_still_ask(self):
         # A different project slug (not holding the current session) is NOT
@@ -4382,7 +4812,7 @@ class SiblingSessionScratchE2ETests(unittest.TestCase):
         other_path = os.path.join(other_proj, self.worker, "tasks", "out.output")
         try:
             os.makedirs(os.path.dirname(other_path), exist_ok=True)
-            self._expect(f"cat {other_path}", "ask", session_id=self.current)
+            self._expect(f"cat {sh(other_path)}", "ask", session_id=self.current)
         finally:
             shutil.rmtree(other_proj, ignore_errors=True)
 
@@ -4391,7 +4821,7 @@ class SiblingSessionScratchE2ETests(unittest.TestCase):
         # inside the sibling scratch pointing outside is still flagged.
         link = self._sibling(self.worker, "link")
         out = self._expect(
-            f"ln -s /tmp/q61-fake-target {link} && cat {link}", "ask",
+            f"ln -s /tmp/q61-fake-target {sh(link)} && cat {sh(link)}", "ask",
             session_id=self.current)
         self.assertIn(link,
                       out["hookSpecificOutput"]["permissionDecisionReason"])
@@ -4427,16 +4857,36 @@ class LiteralAssignmentValueTests(unittest.TestCase):
             self.assertIsNone(guard.literal_assignment_value(v), repr(v))
 
     def test_colon_impure(self):
-        # PATH-style values are excluded so an exotic inherited IFS can't
+        # PATH-style values are excluded so an IFS the hook didn't see can't
         # split them into pieces the single-token check misses.
         self.assertIsNone(guard.literal_assignment_value("/a:/b"))
 
+    def test_drive_prefix_pure_only_where_drives_resolve(self):
+        # Q48: the drive colon is the one `:` that isn't a list separator. On
+        # POSIX `C:/proj/x` is a directory literally named `C:`, so the rule
+        # above stands there and nothing changes.
+        for v in ("C:/proj/x", r"C:\proj\x", r"c:\proj"):
+            self.assertEqual(guard.literal_assignment_value(v),
+                             v if guard.DRIVE_PATHS else None, v)
+
+    def test_second_colon_impure_even_after_drive_prefix(self):
+        # The exemption covers the prefix, not the rest of the value.
+        self.assertIsNone(guard.literal_assignment_value("C:/proj:/etc"))
+
+    def test_drive_letter_without_separator_impure(self):
+        # Bash tilde-expands after a `:` in an assignment RHS, so `C:~/x` is
+        # really `C:/Users/…` — never the literal. `C:` alone is drive-relative,
+        # which resolves against a cwd the hook doesn't track.
+        for v in ("C:~/x", "C:", "C:proj"):
+            self.assertIsNone(guard.literal_assignment_value(v), v)
+
     def test_leading_tilde_slash_expands_to_home(self):
-        home = os.environ.get("HOME")
-        if not home:
-            self.skipTest("HOME not set")
-        self.assertEqual(
-            guard.literal_assignment_value("~/x"), os.path.join(home, "x"))
+        home = guard.resolved_home()                      # Q43: not $HOME
+        self.assertIsNotNone(home, "no home directory resolves")
+        # A Windows home carries a drive colon; Q48 exempts that prefix, so the
+        # expansion is usable as a literal on both platforms.
+        self.assertEqual(guard.literal_assignment_value("~/x"),
+                         os.path.join(home, "x"))
 
     def test_tilde_user_impure(self):
         self.assertIsNone(guard.literal_assignment_value("~someuser/x"))
@@ -4599,6 +5049,38 @@ class PoisonVarsTests(unittest.TestCase):
         self.assertEqual(m, {"f": "x"})
 
 
+class ClobbersIfsTests(unittest.TestCase):
+    """Groups that set IFS outside the plain/`export` assignment forms (Q49)."""
+
+    def test_arg_assigners_naming_ifs(self):
+        for cmd in (["declare", "IFS=x"], ["local", "IFS=x"],
+                    ["typeset", "IFS=x"], ["readonly", "IFS=x"],
+                    ["declare", "-x", "IFS=x"], ["read", "IFS"],
+                    ["printf", "-v", "IFS", "x"], ["for", "IFS", "in", "a"]):
+            self.assertTrue(guard.clobbers_ifs(cmd), cmd)
+
+    def test_eval_and_source_clobber(self):
+        for cmd in ("eval", "source", "."):
+            self.assertTrue(guard.clobbers_ifs([cmd, "lib.sh"]), cmd)
+
+    def test_unnameable_arg_clobbers(self):
+        # `declare $n=x` could name IFS.
+        self.assertTrue(guard.clobbers_ifs(["declare", "$n=x"]))
+
+    def test_keyword_prefix_skipped_before_dispatch(self):
+        self.assertTrue(guard.clobbers_ifs(["while", "read", "IFS"]))
+
+    def test_unset_is_exempt(self):
+        # bash splits on the default IFS while IFS is unset, which is the
+        # behaviour the hook already models.
+        self.assertFalse(guard.clobbers_ifs(["unset", "IFS"]))
+
+    def test_other_names_do_not_clobber(self):
+        for cmd in (["declare", "IFSX=1"], ["read", "-r", "f"],
+                    ["for", "f", "in", "a"], ["grep", "PAT", "y.txt"], []):
+            self.assertFalse(guard.clobbers_ifs(cmd), cmd)
+
+
 class LiteralForItemTests(unittest.TestCase):
     """Purity check for `for VAR in <list>` items (issue 70)."""
 
@@ -4638,11 +5120,10 @@ class LiteralForItemTests(unittest.TestCase):
             self.assertIsNone(guard.literal_for_item(v), v)
 
     def test_tilde_slash_expands(self):
-        home = os.environ.get("HOME")
-        if not home:
-            self.skipTest("HOME not set")
-        self.assertEqual(
-            guard.literal_for_item("~/x"), os.path.join(home, "x"))
+        home = guard.resolved_home()                      # Q43: not $HOME
+        self.assertIsNotNone(home, "no home directory resolves")
+        self.assertEqual(guard.literal_for_item("~/x"),
+                         os.path.join(home, "x"))         # drive prefix: Q48
 
 
 class ForLoopBindingTests(unittest.TestCase):
@@ -4650,41 +5131,92 @@ class ForLoopBindingTests(unittest.TestCase):
 
     def test_all_literal_list_binds(self):
         self.assertEqual(
-            guard.for_loop_binding(["for", "f", "in", "a", "b", "c"]),
+            guard.for_loop_binding(["for", "f", "in", "a", "b", "c"], {}),
             ("f", ["a", "b", "c"]))
 
     def test_braced_name_form_returns_poison(self):
         # `for f in a $x` — a non-literal item poisons the variable.
         self.assertEqual(
-            guard.for_loop_binding(["for", "f", "in", "a", "$x"]),
+            guard.for_loop_binding(["for", "f", "in", "a", "$x"], {}),
             ("f", None))
 
     def test_glob_item_binds_to_pattern(self):
         self.assertEqual(
-            guard.for_loop_binding(["for", "f", "in", "docs/*.md"]),
+            guard.for_loop_binding(["for", "f", "in", "docs/*.md"], {}),
             ("f", ["docs/*.md"]))
 
     def test_mixed_literal_and_glob_list_binds(self):
         self.assertEqual(
-            guard.for_loop_binding(["for", "f", "in", "a", "docs/*.md"]),
+            guard.for_loop_binding(["for", "f", "in", "a", "docs/*.md"], {}),
             ("f", ["a", "docs/*.md"]))
 
     def test_for_name_without_in_poisons(self):
         # `for f; do …` iterates "$@" — unresolvable.
-        self.assertEqual(guard.for_loop_binding(["for", "f"]), ("f", None))
+        self.assertEqual(guard.for_loop_binding(["for", "f"], {}), ("f", None))
 
     def test_empty_list_poisons(self):
-        self.assertEqual(guard.for_loop_binding(["for", "f", "in"]), ("f", None))
+        self.assertEqual(guard.for_loop_binding(["for", "f", "in"], {}), ("f", None))
 
     def test_special_name_not_bound(self):
-        self.assertIsNone(guard.for_loop_binding(["for", "IFS", "in", "a"]))
+        self.assertIsNone(guard.for_loop_binding(["for", "IFS", "in", "a"], {}))
 
     def test_arithmetic_form_not_a_binding(self):
         # `for ((i=0;…))` tokenizes with `(` at index 1 — not `for NAME in`.
-        self.assertIsNone(guard.for_loop_binding(["for", "(", "(", "i=0"]))
+        self.assertIsNone(guard.for_loop_binding(["for", "(", "(", "i=0"], {}))
 
     def test_non_for_group_ignored(self):
-        self.assertIsNone(guard.for_loop_binding(["grep", "PAT", "x"]))
+        self.assertIsNone(guard.for_loop_binding(["grep", "PAT", "x"], {}))
+
+    def test_item_using_outer_loop_var_binds_cross_product(self):
+        # Q41: `for d in a b; do for f in "$d"/*.md` — one candidate per
+        # (outer candidate, item) pair.
+        self.assertEqual(
+            guard.for_loop_binding(["for", "f", "in", "$d/*.md"],
+                                   {"d": ["a", "b"]}),
+            ("f", ["a/*.md", "b/*.md"]))
+
+    def test_item_using_unbound_var_still_poisons(self):
+        self.assertEqual(
+            guard.for_loop_binding(["for", "f", "in", "$d/*.md"],
+                                   {"other": ["a"]}),
+            ("f", None))
+
+    def test_expanded_item_with_brace_poisons(self):
+        # The brace check runs on the expanded item.
+        self.assertEqual(
+            guard.for_loop_binding(["for", "f", "in", "$d/x"],
+                                   {"d": ["a", "{b,c}"]}),
+            ("f", None))
+
+    def test_over_cap_candidate_set_poisons(self):
+        items = ["a%d" % i for i in range(guard.MAX_LOOP_CANDIDATES + 1)]
+        self.assertEqual(
+            guard.for_loop_binding(["for", "f", "in"] + items, {}),
+            ("f", None))
+
+    def test_at_cap_candidate_set_binds(self):
+        items = ["a%d" % i for i in range(guard.MAX_LOOP_CANDIDATES)]
+        name, values = guard.for_loop_binding(["for", "f", "in"] + items, {})
+        self.assertEqual(len(values), guard.MAX_LOOP_CANDIDATES)
+
+    def test_cross_product_over_cap_poisons(self):
+        # Depth multiplies: the cap bounds the nested cross product too.
+        outer = ["d%d" % i for i in range(20)]
+        items = ["$d/x%d" % i for i in range(20)]
+        self.assertEqual(
+            guard.for_loop_binding(["for", "f", "in"] + items, {"d": outer}),
+            ("f", None))
+
+    def test_single_over_cap_item_poisons(self):
+        # One item can be over-cap on its own — `$a/$b` over two full outer
+        # loops is 65536 pairs. The answer was always poison; Q46 is what
+        # reaches it without materialising the 65536 first.
+        n = guard.MAX_LOOP_CANDIDATES
+        loopmap = {"a": ["x%d" % i for i in range(n)],
+                   "b": ["y%d" % i for i in range(n)]}
+        self.assertEqual(
+            guard.for_loop_binding(["for", "f", "in", "$a/$b"], loopmap),
+            ("f", None))
 
 
 class ExpandLoopCandidatesTests(unittest.TestCase):
@@ -4718,6 +5250,19 @@ class ExpandLoopCandidatesTests(unittest.TestCase):
 
     def test_empty_map_unchanged(self):
         self.assertEqual(guard.expand_loop_candidates("$f", {}), ["$f"])
+
+    def test_at_cap_cross_product_expands(self):
+        n = guard.MAX_LOOP_CANDIDATES
+        loopmap = {"a": ["x%d" % i for i in range(n // 2)], "b": ["p", "q"]}
+        self.assertEqual(len(guard.expand_loop_candidates("$a/$b", loopmap)), n)
+
+    def test_over_cap_cross_product_returns_none(self):
+        # Q46: the product is known from the per-variable candidate counts, so
+        # an over-cap token is rejected without expanding anything. None is a
+        # poison — the caller keeps the runtime-expanded `ask`.
+        n = guard.MAX_LOOP_CANDIDATES
+        loopmap = {"a": ["x%d" % i for i in range(n)], "b": ["p", "q"]}
+        self.assertIsNone(guard.expand_loop_candidates("$a/$b", loopmap))
 
 
 class VarPropagationEndToEndTests(unittest.TestCase):
@@ -4766,6 +5311,19 @@ class VarPropagationEndToEndTests(unittest.TestCase):
             "/etc/q58-fake-target",
             out["hookSpecificOutput"]["permissionDecisionReason"],
         )
+
+    def test_absolute_workspace_path_var_allow(self):
+        # The value is the whole workspace path, which on Windows carries a
+        # drive colon — impure before Q48, so propagation was dead there.
+        target = os.path.join(self.workspace, "in.txt")
+        self._decision("f=%s; cat $f" % sh(target), "allow")
+
+    def test_absolute_outside_path_var_ask(self):
+        # Same shape, outside the workspace: Q48 lets the path resolve, it does
+        # not exempt it from the boundary check.
+        drive = os.path.splitdrive(self.workspace)[0]
+        target = os.path.join(drive + os.sep, "q48-fake-target")
+        self._decision("f=%s; cat $f" % sh(target), "ask")
 
     def test_literal_var_host_temp_deny(self):
         # The issue's motivating example: `SP=/tmp/...; tail -5 $SP/x.csv`.
@@ -4854,6 +5412,25 @@ class VarPropagationEndToEndTests(unittest.TestCase):
 
     def test_ifs_reassignment_disables_propagation(self):
         self._decision("IFS=,; f=in.txt; cat $f", "ask")
+
+    def test_arg_assigner_setting_ifs_disables_propagation(self):
+        # Q49: these reach IFS without going through apply_assignment_group.
+        for setter in ("declare IFS=x", "local IFS=x", "typeset IFS=x",
+                       "readonly IFS=x", "read IFS", "printf -v IFS x",
+                       "for IFS in a b; do :; done", "eval 'IFS=x'"):
+            with self.subTest(setter=setter):
+                self._decision(f"{setter}; f=in.txt; cat $f", "ask")
+
+    def test_ifs_split_reaches_a_second_outside_word(self):
+        # The reason the rule exists: bash splits `docs/x/opt/q49-fake-target`
+        # into `docs/` and `/opt/q49-fake-target` under IFS=x, so a value that
+        # resolves inside the workspace reads a file outside it.
+        self._decision(
+            "declare IFS=x; f=docs/x/opt/q49-fake-target; cat $f", "ask")
+
+    def test_unset_ifs_keeps_propagation(self):
+        # Unsetting IFS restores the default splitting the hook models.
+        self._decision("unset IFS; f=in.txt; cat $f", "allow")
 
     def test_heredoc_disables_propagation(self):
         # Heredoc bodies tokenize as commands; a body line shaped like an
@@ -5007,6 +5584,111 @@ class ForLoopPropagationEndToEndTests(unittest.TestCase):
         self._decision(
             "cd /tmp/q99-fake && for f in *.log\ndo\n  cat $f\ndone", "deny")
 
+    # --- a nested loop's list may use the outer variable (Q41) ---------------
+
+    def test_nested_glob_over_glob_allow(self):
+        # Q41's motivating shape: both levels glob, and the inner list is built
+        # from the outer variable. The inner binding is `wf/*/*.yml`.
+        self._decision(
+            'for d in wf/*\ndo\n  for f in "$d"/*.yml\n  do\n    cat "$f"\n'
+            '  done\ndone', "allow")
+
+    def test_nested_loop_one_line_allow(self):
+        # Same shape written on one line — the inner header shares its group
+        # with the enclosing `do`.
+        self._decision(
+            'for d in wf/*; do for f in "$d"/*.yml; do cat "$f"; done; done',
+            "allow")
+
+    def test_nested_literal_outer_binds_cross_product_allow(self):
+        self._decision(
+            'for d in wf sub\ndo\n  for f in "$d"/*.yml\n  do\n    cat "$f"\n'
+            '  done\ndone', "allow")
+
+    def test_nested_three_deep_allow(self):
+        self._decision(
+            'for a in wf\ndo\n  for b in "$a"/*\n  do\n    for c in "$b"/*.yml\n'
+            '    do\n      cat "$c"\n    done\n  done\ndone', "allow")
+
+    def test_nested_outer_candidate_outside_ask(self):
+        # An outside outer candidate carries into every inner binding built
+        # from it, so the inner loop's reads prompt.
+        out = self._decision(
+            'for d in wf /etc/q41-fake\ndo\n  for f in "$d"/*.yml\n  do\n'
+            '    cat "$f"\n  done\ndone', "ask")
+        self.assertIn(
+            "/etc/q41-fake",
+            out["hookSpecificOutput"]["permissionDecisionReason"])
+
+    def test_nested_inner_item_climbs_out_ask(self):
+        # The inner list escapes the root even though the outer one doesn't.
+        self._decision(
+            'for d in wf\ndo\n  for f in "$d"/../../../etc/q41-fake/*\n  do\n'
+            '    cat "$f"\n  done\ndone', "ask")
+
+    def test_nested_poisoned_outer_poisons_inner_ask(self):
+        # `$d` is unresolvable, so `"$d"/*.yml` keeps its `$` and poisons `f`.
+        self._decision(
+            'for d in $x\ndo\n  for f in "$d"/*.yml\n  do\n    cat "$f"\n'
+            '  done\ndone', "ask")
+
+    def test_nested_brace_in_inner_item_poisons_ask(self):
+        # Brace rejection applies to the expanded item, not just a bare one.
+        self._decision(
+            'for d in wf\ndo\n  for f in "$d"/{a,b}.yml\n  do\n    cat "$f"\n'
+            '  done\ndone', "ask")
+
+    def test_nested_inner_reusing_outer_name_allow(self):
+        # `for d in "$d"/*.yml` reads the OUTER d to build the list, then
+        # rebinds it — the expansion must happen before the rebind.
+        self._decision(
+            'for d in wf/*\ndo\n  for d in "$d"/*.yml\n  do\n    cat "$d"\n'
+            '  done\ndone', "allow")
+
+    # --- the candidate cross product is bounded (Q46) ------------------------
+
+    def _cap_lists(self, *prefixes):
+        n = guard.MAX_LOOP_CANDIDATES
+        return tuple(" ".join("%s%d" % (p, i) for i in range(n))
+                     for p in prefixes)
+
+    def test_deep_cross_product_asks_without_hanging(self):
+        # Three nested loops over the cap's worth of literals each make
+        # `$a/$b/$c` stand for 16.7M paths. Enumerating them ran past two
+        # minutes, and a hook that never answers is a non-blocking error — the
+        # guard would enforce nothing at all. run_hook's timeout fails this on
+        # a hang rather than wedging the suite.
+        self._decision(
+            "for a in %s; do for b in %s; do for c in %s; do cat $a/$b/$c; "
+            "done; done; done" % self._cap_lists("a", "b", "c"), "ask")
+
+    def test_deep_cross_product_in_inner_list_asks(self):
+        # The same blowup one level up, where the over-cap product is a
+        # for-LIST item: the bound has to apply before the list is built, not
+        # only when a file arg is checked.
+        self._decision(
+            "for a in %s; do for b in %s; do for c in %s; do "
+            "for d in $a/$b/$c; do cat $d; done; done; done; done"
+            % self._cap_lists("a", "b", "c"), "ask")
+
+    def test_at_cap_cross_product_still_resolves_allow(self):
+        # The bound is on the product, not the nesting depth: a cap-sized outer
+        # list times a single inner candidate is exactly at the cap, so it
+        # still expands and an in-workspace read allows as before.
+        outer, = self._cap_lists("a")
+        self._decision(
+            "for a in %s; do for b in wf; do cat $b/$a; done; done" % outer,
+            "allow")
+
+    def test_over_cap_cross_product_poisons_rather_than_truncates(self):
+        # One candidate past the cap and the same in-workspace read prompts.
+        # Over-cap must poison: truncating to the first N candidates would
+        # check a prefix and silently allow whatever the rest resolved to.
+        outer, = self._cap_lists("a")
+        self._decision(
+            "for a in %s; do for b in wf sub; do cat $b/$a; done; done" % outer,
+            "ask")
+
     # --- uncertainty keeps today's ask ---------------------------------------
 
     def test_brace_item_poisons(self):
@@ -5070,12 +5752,23 @@ class PluginWiringTests(unittest.TestCase):
 
     # --- hooks/hooks.json ----------------------------------------------------
 
-    def test_hooks_json_registers_pretooluse_bash(self):
-        data = self._load_json("hooks/hooks.json")
+    def _shell_matcher(self, data):
         pre = data.get("hooks", {}).get("PreToolUse")
         self.assertIsInstance(pre, list, "hooks.PreToolUse must be a list")
         matchers = [e.get("matcher") for e in pre]
-        self.assertIn("Bash", matchers, "no PreToolUse entry matches Bash")
+        matcher = next((m for m in matchers if m and "Bash" in m), None)
+        self.assertIsNotNone(matcher, "no PreToolUse entry matches Bash")
+        return matcher
+
+    def test_hooks_json_registers_pretooluse_shell_tools(self):
+        # Q51: PowerShell is the shell tool on a Windows box without Git for
+        # Windows. Unmatched, the plugin loads, reports itself active, and
+        # checks no shell command at all.
+        data = self._load_json("hooks/hooks.json")
+        matcher = self._shell_matcher(data)
+        for tool in ("Bash", "PowerShell"):
+            self.assertIn(tool, matcher,
+                          f"{tool} not covered by matcher {matcher!r}")
 
     def test_hooks_json_registers_pretooluse_edit_tools(self):
         # Issue 62: the sibling-checkout deny also hooks the file-editing tools.
@@ -5107,14 +5800,15 @@ class PluginWiringTests(unittest.TestCase):
 
     def test_hooks_json_command_path_exists(self):
         data = self._load_json("hooks/hooks.json")
+        matcher = self._shell_matcher(data)
         entry = next(
-            e for e in data["hooks"]["PreToolUse"] if e.get("matcher") == "Bash"
+            e for e in data["hooks"]["PreToolUse"] if e.get("matcher") == matcher
         )
         commands = [
             h["command"] for h in entry["hooks"]
             if h.get("type") == "command" and "command" in h
         ]
-        self.assertTrue(commands, "Bash matcher has no command-type hook")
+        self.assertTrue(commands, "shell matcher has no command-type hook")
         # Every referenced "${CLAUDE_PLUGIN_ROOT}/<rel>" path must exist in the
         # repo (the plugin root is the repo root at install time).
         marker = "${CLAUDE_PLUGIN_ROOT}/"
@@ -5210,6 +5904,137 @@ class PluginWiringTests(unittest.TestCase):
         )
 
 
+class CIWiringTests(unittest.TestCase):
+    """Q45: a skipped test reads as OK, so a plain `unittest discover` on
+    Windows can't tell "passes there" from "quietly stopped running there".
+    The job runs through the skip ceiling instead."""
+
+    def test_windows_job_runs_the_suite_through_the_skip_ceiling(self):
+        self.assertTrue((REPO / "scripts" / "skip-ceiling.py").is_file(),
+                        "missing scripts/skip-ceiling.py")
+        workflow = (REPO / ".github" / "workflows" / "tests.yml").read_text()
+        self.assertRegex(
+            workflow, r"skip-ceiling\.py --max-skips \d+",
+            "the Windows job must run the suite through skip-ceiling.py",
+        )
+
+    def test_windows_suite_also_runs_under_git_bash(self):
+        # Q44: the hook process and the shell it parses for are different
+        # processes with different environments. run-python-hook.cmd gives the
+        # hook a cmd.exe environment (what the default-shell job covers), while
+        # the commands it reads were written for Git Bash. Dropping the Git Bash
+        # job leaves every environment-reading helper verified in one of the two
+        # Windows environments it has to be right in.
+        workflow = (REPO / ".github" / "workflows" / "tests.yml").read_text()
+        self.assertRegex(
+            workflow, r"skip-ceiling\.py --max-skips \d+\n\s+shell: bash",
+            "a Windows job must run the suite under Git Bash (shell: bash)",
+        )
+
+
+@unittest.skipUnless(guard.DRIVE_PATHS, "MSYS forms only differ where paths "
+                                        "carry drive letters")
+class MsysPathFormWindowsTests(unittest.TestCase):
+    """Q52 end-to-end: the decision a real command in MSYS form gets on Windows.
+
+    MsysPathFormTests covers the rewrite itself everywhere; these run the whole
+    chain -- tokenizer, cwd tracking, config resolution, decision -- and so only
+    mean anything where a leading slash is genuinely ambiguous.
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.workspace = os.path.realpath(self._tmp.name)
+        with open(os.path.join(self.workspace, "in.txt"), "w") as f:
+            f.write("hello\n")
+
+    @staticmethod
+    def _msys(path):
+        """Native path -> the form a command would be written in under Git Bash."""
+        drive, rest = os.path.splitdrive(path)
+        return "/" + drive[0].lower() + rest.replace("\\", "/")
+
+    def _decision(self, cmd, expected, **kw):
+        out = run_hook(cmd, self.workspace, **kw)
+        self.assertIsNotNone(out, f"expected a decision, got defer for: {cmd!r}")
+        hook = out["hookSpecificOutput"]
+        self.assertEqual(hook["permissionDecision"], expected,
+                         f"{cmd!r} -> {hook!r}")
+        return hook.get("permissionDecisionReason", "")
+
+    def test_workspace_file_in_msys_form_is_allowed(self):
+        # The drive mapping's whole point: this names a file inside the root,
+        # and before Q52 it resolved to `<drive>\c\...` and prompted.
+        self._decision("cat %s" % self._msys(
+            os.path.join(self.workspace, "in.txt")), "allow")
+
+    def test_cd_in_msys_form_keeps_tracking(self):
+        self._decision("cd %s && cat in.txt" % self._msys(self.workspace),
+                       "allow")
+
+    def test_outside_prompt_names_the_path_bash_will_open(self):
+        reason = self._decision("cat /c/Users/nobody/q52-fake-target", "ask")
+        self.assertIn(r"C:\Users\nobody\q52-fake-target", reason)
+        self.assertNotIn(r"\c\Users\nobody", reason)
+
+    def test_tmp_deny_names_the_real_temp_dir(self):
+        # `/tmp` is the usertemp mount, not <drive>\tmp. The deny already fired
+        # before Q52 -- on a path the command was never going to write.
+        reason = self._decision("echo hi > /tmp/q52-fake-target", "deny")
+        self.assertIn(
+            os.path.join(os.path.realpath(tempfile.gettempdir()),
+                         "q52-fake-target"),
+            reason)
+
+    def test_read_allow_prefix_in_msys_form_matches(self):
+        # The dead-knob half of Q52: an entry written the way a Git Bash user
+        # writes paths resolved onto another drive and exempted nothing.
+        outside = os.path.realpath(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, outside, True)
+        target = os.path.join(outside, "shared.txt")
+        with open(target, "w") as f:
+            f.write("x\n")
+        self._decision("cat %s" % sh(target), "allow", env_extra={
+            "WORKSPACE_GUARD_READ_ALLOW_PREFIXES": self._msys(outside)})
+
+
+class MsysEnvironmentTests(unittest.TestCase):
+    """Q44: what the guard reads from the environment under Git Bash.
+
+    MSYS rewrites path-shaped variables on the way into a native binary: the
+    shell holds `HOME=/c/Users/x` and `TMP=/tmp`, and the Python it launches
+    sees `C:\\Users\\x` and the real temp directory. Every path the guard
+    derives from the environment rides on that conversion, and a leading-slash
+    path is not absolute under ntpath -- so if it ever stopped, `resolved_home`
+    would return None (no tilde expansion, Q43 undone) and the real temp
+    directory would drop out of the host-temp roots, both silently.
+
+    These assert the conversion, not the guard's parsing, and only mean
+    anything in the environment that performs it.
+    """
+
+    def setUp(self):
+        if os.name != "nt" or not os.environ.get("MSYSTEM"):
+            self.skipTest("not running under MSYS/Git Bash on Windows")
+
+    def test_home_arrives_in_native_form(self):
+        self.assertIsNotNone(
+            guard.resolved_home(),
+            "resolved_home() is None under Git Bash: $HOME reached Python in "
+            "MSYS form, which ntpath does not consider absolute",
+        )
+
+    def test_platform_temp_dir_is_a_host_temp_root(self):
+        # tempfile.gettempdir() reads %TMP%, which is `/tmp` in the shell. In
+        # MSYS form it resolves to <drive>\tmp -- a directory that does not
+        # exist -- and the real temp dir stops being a host-temp root at all,
+        # downgrading its `deny` tier to a plain `ask`.
+        real_temp = os.path.realpath(tempfile.gettempdir())
+        self.assertTrue(os.path.isabs(real_temp))
+        self.assertIn(real_temp, guard.host_temp_roots(os.getcwd()))
+
+
 class NativeToolTests(unittest.TestCase):
     """Q29: the native Read/Grep/Glob (read) and Edit/Write (write) tools get the
     same outside-workspace verdict as the equivalent bash command, routed through
@@ -5220,9 +6045,9 @@ class NativeToolTests(unittest.TestCase):
     /tmp `deny`. No real sensitive paths are used as targets (repo rule)."""
 
     def setUp(self):
-        home = os.environ.get("HOME")
-        if not home or not os.path.isdir(home):
-            self.skipTest("HOME not set")
+        home = guard.resolved_home()                      # Q43: not $HOME
+        self.assertTrue(home and os.path.isdir(home),
+                        f"no home directory to build the fixture under: {home!r}")
         self._tmp = tempfile.TemporaryDirectory(dir=home)
         self.base = os.path.realpath(self._tmp.name)
         self.workspace = os.path.join(self.base, "proj")
@@ -5354,6 +6179,466 @@ class NativeToolTests(unittest.TestCase):
         out = self._run("NotebookEdit",
                         {"notebook_path": os.path.join(self.outside_dir, "n.ipynb")})
         self.assertEqual(self._decision(out), "ask")
+
+
+# --- Q51: the PowerShell tool ------------------------------------------------
+
+# Lets a fixture pass `tool_input=None` to mean "omit the key entirely", which
+# `None` as a default could not express.
+_UNSET = object()
+
+
+def ps(path):
+    """Quote a native path for a PowerShell fixture — the `sh()` of this
+    frontend, and deliberately not `sh()` itself.
+
+    `shlex.quote` is POSIX quoting: it leaves a backslash bare, which is right
+    for bash and wrong here only in the other direction — what actually breaks a
+    Windows-CI fixture is a space in the interpolated path. Single quotes are
+    literal in PowerShell, so they carry the backslashes through intact and
+    survive a `C:\\Program Files`-shaped home.
+    """
+    return "'" + path.replace("'", "''") + "'"
+
+
+class PowerShellSpecShapeTests(unittest.TestCase):
+    """Invariants the PS_SPEC table has to hold for the binder to be correct."""
+
+    def test_spec_covers_documented_cmdlets(self):
+        self.assertEqual(
+            set(guard.PS_SPEC.keys()),
+            {"get-content", "select-string", "import-csv", "import-clixml",
+             "set-content", "add-content", "out-file", "tee-object",
+             "export-csv", "export-clixml",
+             "copy-item", "move-item", "remove-item", "rename-item"},
+        )
+
+    def test_positional_slots_are_declared_parameter_names(self):
+        # A slot is a parameter name, not a role: binding `-Pattern` by name has
+        # to close slot 0 so the file lands in slot 1. A typo'd slot name would
+        # silently never match a file parameter and never be checked.
+        rows = dict(guard.PS_SPEC, __location__=guard.PS_LOCATION_SPEC)
+        for name, row in rows.items():
+            for slot in row["positional"]:
+                self.assertIn(slot, row["names"],
+                              f"{name}: positional slot {slot!r} is not a "
+                              f"declared parameter")
+
+    def test_file_roles_are_read_or_write(self):
+        for name, row in guard.PS_SPEC.items():
+            for param, role in row["files"].items():
+                self.assertIn(role, ("read", "write"), f"{name}.-{param}")
+
+    def test_file_and_consume_are_disjoint(self):
+        # A parameter declared both ways would have its path swallowed as a
+        # value — the silent-allow direction.
+        for name, row in guard.PS_SPEC.items():
+            self.assertFalse(set(row["files"]) & row["consume"],
+                             f"{name}: parameter is both a file and a value")
+
+    def test_aliases_resolve_to_real_rows(self):
+        known = set(guard.PS_SPEC) | guard.PS_LOCATION_CMDS
+        for alias, target in guard.PS_ALIASES.items():
+            self.assertIn(target, known, f"alias {alias!r} -> unknown {target!r}")
+
+    def test_posix_lookalike_aliases_do_not_reach_the_bash_spec(self):
+        # `cat`, `rm`, `cp`, `mv`, `tee` name cmdlets with entirely different
+        # flag sets here. Routing them to the SPEC row of the same name is the
+        # aliasing mistake Q3 recorded.
+        for alias in ("cat", "rm", "cp", "mv", "tee", "sc", "type"):
+            self.assertIn(alias, guard.PS_ALIASES)
+            self.assertIn(guard.PS_ALIASES[alias], guard.PS_SPEC)
+
+
+class PowerShellTokenizerTests(unittest.TestCase):
+    """The tokenizer is the load-bearing difference from the bash frontend."""
+
+    def words(self, text):
+        toks = guard.ps_tokenize(text)
+        self.assertIsNotNone(toks, f"unexpected defer for {text!r}")
+        return [t[1] for t in toks if t[0] == "word"]
+
+    def test_backslash_is_a_path_character_not_an_escape(self):
+        # The whole reason this is not shlex. In POSIX mode `C:\Users\x`
+        # tokenizes to `C:Usersx`, which resolves INSIDE the project root.
+        self.assertEqual(self.words(r"Get-Content C:\Users\bob\x"),
+                         ["Get-Content", r"C:\Users\bob\x"])
+
+    def test_shlex_would_have_eaten_the_backslashes(self):
+        # Pins the premise above rather than trusting it.
+        self.assertEqual(shlex.split(r"Get-Content C:\Users\bob\x"),
+                         ["Get-Content", "C:Usersbobx"])
+
+    def test_backtick_is_the_escape_character(self):
+        # An escaped space joins the token; an unescaped one still separates.
+        self.assertEqual(self.words("Get-Content a` b"), ["Get-Content", "a b"])
+        self.assertEqual(self.words("Get-Content a b"), ["Get-Content", "a", "b"])
+
+    def test_backtick_before_a_path_letter_is_the_letter(self):
+        self.assertEqual(self.words(r"Get-Content `C:\x"), ["Get-Content", r"C:\x"])
+
+    def test_single_quotes_are_literal(self):
+        self.assertEqual(self.words(r"Get-Content 'C:\a b\$x'"),
+                         ["Get-Content", r"C:\a b\$x"])
+
+    def test_doubled_quote_inside_a_quoted_run(self):
+        self.assertEqual(self.words("Get-Content 'it''s'"), ["Get-Content", "it's"])
+
+    def test_unbalanced_quote_defers(self):
+        self.assertIsNone(guard.ps_tokenize('Get-Content "unterminated'))
+        self.assertIsNone(guard.ps_tokenize("Get-Content 'unterminated"))
+
+    def test_dollar_marks_a_token_expandable(self):
+        toks = guard.ps_tokenize(r'Get-Content $env:USERPROFILE\x')
+        self.assertTrue(toks[1][2], "token with $ should be expandable")
+
+    def test_dollar_inside_single_quotes_is_not_expandable(self):
+        toks = guard.ps_tokenize(r"Get-Content '$env:USERPROFILE'")
+        self.assertFalse(toks[1][2])
+
+    def test_dollar_inside_double_quotes_is_expandable(self):
+        toks = guard.ps_tokenize(r'Get-Content "$env:USERPROFILE"')
+        self.assertTrue(toks[1][2])
+
+    def test_stream_selector_glues_to_the_redirect(self):
+        toks = guard.ps_tokenize(r"Get-Content a 2> C:\x")
+        self.assertIn(("redir", "2>", False, False), toks)
+        self.assertEqual([t[1] for t in toks if t[0] == "word"],
+                         ["Get-Content", "a", r"C:\x"])
+
+    def test_separators_split_segments(self):
+        toks = guard.ps_tokenize("a | b; c && d")
+        self.assertEqual([t[1] for t in toks if t[0] == "op"], ["|", ";", "&&"])
+
+    def test_line_comment_is_dropped(self):
+        self.assertEqual(self.words("Get-Content a # Get-Content C:\\x"),
+                         ["Get-Content", "a"])
+
+    def test_hash_inside_a_token_is_not_a_comment(self):
+        self.assertEqual(self.words("Get-Content 'a#b'"), ["Get-Content", "a#b"])
+
+    def test_block_comment_is_dropped(self):
+        self.assertEqual(self.words("<# note #> Get-Content a"),
+                         ["Get-Content", "a"])
+
+    def test_backtick_newline_continues_the_line(self):
+        self.assertEqual(self.words("Get-Content `\na"), ["Get-Content", "a"])
+
+
+class PowerShellHereStringTests(unittest.TestCase):
+    def test_literal_here_string_body_is_dropped(self):
+        out = guard.ps_strip_here_strings("Set-Content x @'\n$(evil)\n'@\n")
+        self.assertNotIn("evil", out)
+
+    def test_expandable_body_survives_the_literal_only_pass(self):
+        # It has to: PowerShell runs a `$(…)` written in an @"…"@ body, so the
+        # subexpression scan needs to see it.
+        text = 'Set-Content x @"\n$(Get-Content C:\\x)\n"@\n'
+        self.assertIn("Get-Content C:", guard.ps_strip_here_strings(
+            text, literal_only=True))
+        self.assertNotIn("Get-Content C:", guard.ps_strip_here_strings(text))
+
+    def test_unterminated_here_string_defers(self):
+        self.assertIsNone(guard.ps_strip_here_strings('Set-Content x @"\nbody'))
+
+
+class PowerShellSubexpressionTests(unittest.TestCase):
+    def test_body_is_extracted_and_masked(self):
+        masked, bodies = guard.ps_subexpressions(r"Write-Output $(Get-Content C:\x)")
+        self.assertEqual(bodies, [r"Get-Content C:\x"])
+        self.assertEqual(masked, "Write-Output $")
+
+    def test_body_inside_double_quotes_is_extracted(self):
+        _, bodies = guard.ps_subexpressions(r'Write-Output "$(Get-Content C:\x)"')
+        self.assertEqual(bodies, [r"Get-Content C:\x"])
+
+    def test_paren_in_quoted_prose_does_not_close_the_body(self):
+        _, bodies = guard.ps_subexpressions(r'$(Get-Content "a)b" C:\x)')
+        self.assertEqual(bodies, [r'Get-Content "a)b" C:\x'])
+
+    def test_nested_bodies_are_extracted(self):
+        _, bodies = guard.ps_subexpressions(r"$(a $(Get-Content C:\x))")
+        self.assertIn(r"Get-Content C:\x", bodies)
+
+    def test_unbalanced_quote_is_not_closed_for_the_tokenizer(self):
+        # Fabricating the missing quote here would hand the tokenizer a
+        # balanced string and turn a defer into a parse.
+        masked, _ = guard.ps_subexpressions('Get-Content "unterminated')
+        self.assertIsNone(guard.ps_tokenize(masked))
+
+
+class PowerShellBindArgsTests(unittest.TestCase):
+    """Parameter binding — the layer where a shifted operand becomes a silent
+    allow."""
+
+    def bind(self, cmdlet, text):
+        toks = guard.ps_tokenize(text)
+        return [(t, role) for t, _, _, role in
+                guard.ps_bind_args(toks[1:], guard.PS_SPEC[cmdlet])]
+
+    def test_positional_path(self):
+        self.assertEqual(self.bind("get-content", r"Get-Content C:\x"),
+                         [(r"C:\x", "read")])
+
+    def test_named_path(self):
+        self.assertEqual(self.bind("get-content", r"Get-Content -Path C:\x"),
+                         [(r"C:\x", "read")])
+
+    def test_literalpath_is_a_file_parameter(self):
+        self.assertEqual(self.bind("get-content", r"Get-Content -LiteralPath C:\x"),
+                         [(r"C:\x", "read")])
+
+    def test_colon_bound_value(self):
+        self.assertEqual(self.bind("get-content", r"Get-Content -Path:C:\x"),
+                         [(r"C:\x", "read")])
+
+    def test_unambiguous_prefix_resolves(self):
+        self.assertEqual(self.bind("get-content", r"Get-Content -Pat C:\x"),
+                         [(r"C:\x", "read")])
+
+    def test_ambiguous_prefix_falls_back_to_a_switch(self):
+        # `-P` matches Path and PipelineVariable. Unresolved, it reads as a
+        # switch and the value stays a positional — so the file is still
+        # checked, which is the safe way to be wrong.
+        self.assertEqual(self.bind("get-content", r"Get-Content -P C:\x"),
+                         [(r"C:\x", "read")])
+
+    def test_value_taking_parameter_does_not_shift_the_operand(self):
+        # Undeclared, `-Encoding` would leak UTF8 into slot 0 (-Path) and push
+        # the real target into slot 1 (-Value), where it is never checked.
+        self.assertEqual(
+            self.bind("set-content", r"Set-Content -Encoding UTF8 C:\x hi"),
+            [(r"C:\x", "write")])
+
+    def test_named_binding_closes_its_positional_slot(self):
+        # `-Pattern` bound by name means the file takes slot 1 (-Path), whatever
+        # the order. A one-pass binder gives it slot 0 and never checks it.
+        self.assertEqual(
+            self.bind("select-string", r"Select-String -Pattern foo C:\x"),
+            [(r"C:\x", "read")])
+        self.assertEqual(
+            self.bind("select-string", r"Select-String C:\x -Pattern foo"),
+            [(r"C:\x", "read")])
+
+    def test_destination_bound_by_name_frees_the_source_slot(self):
+        self.assertEqual(
+            self.bind("copy-item", r"Copy-Item -Destination C:\d C:\s"),
+            [(r"C:\d", "write"), (r"C:\s", "read")])
+
+    def test_pattern_positional_is_not_a_file(self):
+        self.assertEqual(self.bind("select-string", r"Select-String foo C:\x"),
+                         [(r"C:\x", "read")])
+
+    def test_value_positional_is_not_a_file(self):
+        self.assertEqual(self.bind("set-content", r"Set-Content C:\x C:\y"),
+                         [(r"C:\x", "write")])
+
+    def test_trailing_operands_repeat_the_last_slot(self):
+        self.assertEqual(self.bind("remove-item", r"Remove-Item C:\a C:\b C:\c"),
+                         [(r"C:\a", "write"), (r"C:\b", "write"),
+                          (r"C:\c", "write")])
+
+    def test_switches_do_not_consume_the_operand(self):
+        self.assertEqual(
+            self.bind("remove-item", r"Remove-Item -Recurse -Force C:\x"),
+            [(r"C:\x", "write")])
+
+    def test_stop_parsing_marker_ends_binding(self):
+        self.assertEqual(self.bind("get-content", r"Get-Content --% C:\x"), [])
+
+    def test_negative_number_is_not_a_parameter(self):
+        self.assertEqual(self.bind("get-content", r"Get-Content -Tail -5 C:\x"),
+                         [(r"C:\x", "read")])
+
+
+class PowerShellPathPartsTests(unittest.TestCase):
+    def test_unquoted_array_operand_splits(self):
+        self.assertEqual(guard.ps_path_parts(r"a,C:\x", False), ["a", r"C:\x"])
+
+    def test_quoted_operand_keeps_its_comma(self):
+        self.assertEqual(guard.ps_path_parts(r"a,b.txt", True), [r"a,b.txt"])
+
+
+class PowerShellEndToEndTests(unittest.TestCase):
+    """Decisions the script emits for `tool_name: PowerShell`.
+
+    The workspace lives under $HOME so an outside sibling is a plain `outside`
+    ask rather than a host-temp deny. Windows-native targets are synthetic
+    placeholders (repo rule) — the check is lexical, so nothing needs to exist.
+    """
+
+    OUT = r"C:\q51-fake-target\x"
+
+    def setUp(self):
+        home = guard.resolved_home()                      # Q43: not $HOME
+        self.assertTrue(home and os.path.isdir(home),
+                        f"no home directory to build the fixture under: {home!r}")
+        self._tmp = tempfile.TemporaryDirectory(dir=home)
+        self.base = os.path.realpath(self._tmp.name)
+        self.workspace = os.path.join(self.base, "proj")
+        os.makedirs(os.path.join(self.workspace, "docs"))
+        for rel in ("in.txt", "docs/note.md"):
+            with open(os.path.join(self.workspace, rel), "w") as f:
+                f.write("hi\n")
+        self.outside_dir = os.path.join(self.base, "outside")
+        os.makedirs(self.outside_dir)
+        self.outside = os.path.join(self.outside_dir, "secret.txt")
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def _run(self, command, *, tool="PowerShell", tool_input=_UNSET,
+             permission_mode=None, cwd=None):
+        env = os.environ.copy()
+        env["CLAUDE_PROJECT_DIR"] = self.workspace
+        data = {"tool_name": tool, "cwd": cwd or self.workspace,
+                "tool_input": {"command": command}
+                if tool_input is _UNSET else tool_input}
+        if tool_input is None:
+            data.pop("tool_input")
+        if permission_mode is not None:
+            data["permission_mode"] = permission_mode
+        r = subprocess.run([sys.executable, str(SCRIPT)], input=json.dumps(data),
+                           capture_output=True, text=True, env=env, timeout=10)
+        self.assertEqual(r.returncode, 0, f"hook errored: {r.stderr!r}")
+        out = r.stdout.strip()
+        return json.loads(out) if out else None
+
+    def _decide(self, command, expected, **kw):
+        out = self._run(command, **kw)
+        self.assertIsNotNone(out, f"expected {expected}, got defer for {command!r}")
+        got = out["hookSpecificOutput"]["permissionDecision"]
+        self.assertEqual(
+            got, expected,
+            f"expected {expected!r} for {command!r}; got {got!r} (reason: "
+            f"{out['hookSpecificOutput'].get('permissionDecisionReason')!r})")
+        return out
+
+    def _defer(self, command, **kw):
+        out = self._run(command, **kw)
+        self.assertIsNone(out, f"expected defer for {command!r}, got {out!r}")
+
+    # --- the gap Q51 closes --------------------------------------------------
+
+    def test_native_windows_path_is_not_mangled_into_the_workspace(self):
+        # Routed through the POSIX tokenizer this becomes `C:q51-fake-targetx`,
+        # resolves under the project root, and allows silently.
+        self._decide(r"Get-Content C:\q51-fake-target\x", "ask")
+
+    def test_powershell_never_reaches_the_bash_handler(self):
+        # `cat` is Get-Content here. Under the bash SPEC row the same string
+        # would parse with cat's (empty) flag set — a different grammar.
+        self._decide(r"cat C:\q51-fake-target\x", "ask")
+
+    def test_missing_command_field_asks_rather_than_defers(self):
+        # The field name is read off the installed binary, not documented
+        # schema. Deferring here would be indistinguishable from the wiring bug
+        # it would be hiding: a guard that reports itself active and checks
+        # nothing.
+        out = self._run(None, tool_input={"timeout": 5})
+        self.assertIsNotNone(out, "a PowerShell call with no command must not defer")
+        self.assertEqual(out["hookSpecificOutput"]["permissionDecision"], "ask")
+        self.assertIn("tool_input.command",
+                      out["hookSpecificOutput"]["permissionDecisionReason"])
+
+    def test_absent_tool_input_asks(self):
+        out = self._run(None, tool_input=None)
+        self.assertEqual(out["hookSpecificOutput"]["permissionDecision"], "ask")
+
+    # --- parity with the bash frontend ---------------------------------------
+
+    def test_read_outside_asks(self):
+        self._decide("Get-Content %s" % ps(self.outside), "ask")
+
+    def test_read_inside_allows(self):
+        self._decide("Get-Content in.txt", "allow")
+
+    def test_write_outside_asks(self):
+        self._decide("Set-Content %s hi" % ps(self.outside), "ask")
+
+    def test_out_file_outside_asks(self):
+        self._decide("Out-File -FilePath %s" % ps(self.outside), "ask")
+
+    def test_select_string_outside_asks(self):
+        self._decide("Select-String -Pattern foo %s" % ps(self.outside), "ask")
+
+    def test_copy_item_outside_destination_asks(self):
+        self._decide("Copy-Item in.txt %s" % ps(self.outside), "ask")
+
+    def test_redirect_target_outside_asks_whatever_the_command(self):
+        # Q26 parity: a redirect is a shell-level write, honored even though
+        # Write-Output is not a guarded cmdlet.
+        self._decide("Write-Output hi > %s" % ps(self.outside), "ask")
+
+    def test_redirect_target_inside_defers(self):
+        self._defer("Write-Output hi > out.txt")
+
+    def test_unguarded_cmdlet_defers(self):
+        self._defer(r"Get-ChildItem C:\q51-fake-target")
+
+    def test_bypass_permissions_denies(self):
+        self._decide("Get-Content %s" % ps(self.outside), "deny",
+                     permission_mode="bypassPermissions")
+
+    # --- location tracking ---------------------------------------------------
+
+    def test_set_location_moves_the_resolution_base(self):
+        self._decide("Set-Location %s; Get-Content secret.txt"
+                     % ps(self.outside_dir), "ask")
+
+    def test_set_location_inside_still_allows(self):
+        self._decide("Set-Location docs; Get-Content note.md", "allow")
+
+    def test_untracked_location_flags_relative_operands(self):
+        out = self._decide("Set-Location $d; Get-Content secret.txt", "ask")
+        self.assertIn("untracked",
+                      out["hookSpecificOutput"]["permissionDecisionReason"])
+
+    def test_bare_cd_drops_tracking(self):
+        self._decide("cd; Get-Content secret.txt", "ask")
+
+    def test_pop_location_drops_tracking(self):
+        self._decide("Push-Location docs; Pop-Location; Get-Content note.md", "ask")
+
+    # --- deferring, and what must not defer ----------------------------------
+
+    def test_empty_command_defers(self):
+        self._defer("   ")
+
+    def test_unbalanced_quote_defers(self):
+        self._defer('Get-Content "unterminated')
+
+    def test_commented_out_command_defers(self):
+        self._defer(r"# Get-Content C:\q51-fake-target\x")
+
+    def test_expandable_operand_asks(self):
+        out = self._decide(r"Get-Content $env:USERPROFILE\x", "ask")
+        self.assertIn("Runtime-expanded",
+                      out["hookSpecificOutput"]["permissionDecisionReason"])
+
+    def test_subexpression_body_is_analyzed(self):
+        self._decide('Write-Output "$(Get-Content %s)"' % ps(self.outside), "ask")
+
+    def test_script_block_body_is_analyzed(self):
+        self._decide("Get-ChildItem | ForEach-Object { Get-Content %s }"
+                     % ps(self.outside), "ask")
+
+    def test_literal_here_string_body_is_inert(self):
+        self._decide("Set-Content in.txt @'\nGet-Content %s\n'@" % ps(self.outside),
+                     "allow")
+
+    def test_expandable_here_string_body_is_analyzed(self):
+        self._decide('Set-Content in.txt @"\n$(Get-Content %s)\n"@'
+                     % ps(self.outside), "ask")
+
+    def test_assignment_head_is_stripped(self):
+        self._decide("$x = Get-Content %s" % ps(self.outside), "ask")
+
+    def test_array_operand_flags_the_outside_element(self):
+        # An unquoted comma-joined operand, so a synthetic Windows-native
+        # target rather than the fixture path: quoting it would suppress the
+        # split this is about, and the check is lexical either way.
+        self._decide("Get-Content -Path in.txt,%s" % self.OUT, "ask")
 
 
 if __name__ == "__main__":
