@@ -5,7 +5,7 @@ Single source of truth for progress and priorities in workspace-guard. Pick the 
 **Status:** 🔲 ready · 🚫 blocked
 **Size:** S = one session/PR · M = 2–3 sessions · L = needs a plan doc under `docs/plan/`
 **Labels:** `security` `tests` `docs` `infra` `bug` `parsing` `retro`
-**Next ID:** Q56
+**Next ID:** Q64
 
 **Maintaining this file:** see [`docs/development/maintaining-backlog.md`](development/maintaining-backlog.md).
 
@@ -15,7 +15,9 @@ Specific actionable items in priority order. Pick from the top; skip 🚫 items 
 
 | ID | Item | Labels | St | Sz | Notes |
 |---|---|---|---|---|---|
-| <a id="Q55"></a>Q55 | Author release notes in `docs/releases/vX.Y.Z.md` | `docs` `retro` | 🔲 | S | Notes are typed straight into the GitHub Release today, so they never appear in a diff. Author each tag's body as a file, publish it with `gh release edit --notes-file`, and point the runbook at it. |
+| <a id="Q61"></a>Q61 | Analyze the body of a shell `-c` command | `security` | 🔲 | M | The body is one opaque token, so no read, write or kill inside it is checked; Q60 only stopped the hook vouching for it. Recursing needs a container-exec exclusion first — see [plan](plan/q60-ps-pid-source.md). |
+| <a id="Q62"></a>Q62 | Stop a `kill -0` liveness probe reading as a launderable kill | `bug` | 🔲 | S | `kill -0` sends no signal, but any non-literal operand marks it launderable, so `while kill -0 $(pgrep -f x)` denies. Exempt the `-0` flag in `signal_command`. |
+| <a id="Q63"></a>Q63 | Restore the command-substitution recursion cap | `bug` | 🔲 | S | `MAX_SUBST_DEPTH` never fires: `_analyze_command` reuses `depth` as the paren counter before the guard reads it, so 40 nested `$(…)` still recurse. Latent — it errs toward more analysis. |
 
 ## Deferred
 

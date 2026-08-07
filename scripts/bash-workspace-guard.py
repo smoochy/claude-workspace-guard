@@ -609,12 +609,37 @@ def scratch_dir_name():
     return (os.environ.get('WORKSPACE_GUARD_SCRATCH_DIR') or 'tmp/').strip() or 'tmp/'
 
 
-def build_scratch_hint(proj, scratch):
+def session_scratchpad(session_id, session_proj_dir):
+    """Resolved path of the ``scratchpad/`` dir Claude Code hands THIS session,
+    or None when it can't be located.
+
+    Laid out as ``<tmp_root>/<project-slug>/<session-uuid>/scratchpad``, so it
+    sits inside the tree :func:`is_session_tmp_path` exempts for reads *and*
+    writes — the second legitimate destination for a temp file, alongside the
+    repo-local scratch dir. Gated on an ``os.path.isdir`` stat (no file contents
+    read) for the same reason :func:`build_scratch_hint` gates the repo-local
+    name: steering an agent at a directory that isn't there just trades a deny
+    for a "no such file or directory". (Q56)
+    """
+    if not (session_id and session_proj_dir):
+        return None
+    path = os.path.join(session_proj_dir, session_id, 'scratchpad')
+    try:
+        return path if os.path.isdir(path) else None
+    except OSError:
+        return None
+
+
+def build_scratch_hint(proj, scratch, scratchpad=None):
     """One-line guidance steering off host temp toward a repo-local scratch dir.
 
     Names the dir concretely when it already exists under the project root
     (an ``os.path.isdir`` stat — no file contents are read), otherwise tells the
-    user to create and gitignore it. Closes with the two config knobs."""
+    user to create and gitignore it. When ``scratchpad`` is given (see
+    :func:`session_scratchpad`) it is named as the other allowed destination,
+    so an agent denied on ``/tmp`` doesn't infer the harness-managed scratchpad
+    is off-limits too and litter the worktree instead. Closes with the two
+    config knobs."""
     name = scratch.rstrip('/') or 'tmp'
     rel = './' + name + '/'
     present = False
@@ -627,6 +652,10 @@ def build_scratch_hint(proj, scratch):
     else:
         where = ("Create a gitignored `%s` at the repo root (add `/%s/` to "
                  "`.gitignore`) and use `%s` instead." % (name, name, rel))
+    if scratchpad:
+        where += (" This session's own scratchpad `%s` is allowed read-write "
+                  "too — prefer it for a throwaway that shouldn't outlive the "
+                  "session." % scratchpad)
     return ("Host-wide temp is shared across every session and worktree and "
             "lives outside the project root, so concurrent runs collide and the "
             "write escapes the workspace. " + where
@@ -759,9 +788,12 @@ def sibling_checkout_for(rp, session):
     return (co['root'], _branch_label(co['admin']))
 
 
-def sibling_override():
-    """Reason string from ``WORKSPACE_GUARD_OVERRIDE`` (downgrades the sibling
-    deny to ``ask`` for deliberate cross-checkout work), or None when unset."""
+def guard_override():
+    """Reason string from ``WORKSPACE_GUARD_OVERRIDE``, or None when unset.
+
+    Downgrades the two cross-workspace denies to ``ask`` — a write into a
+    sibling checkout, and an unanchored process kill — for work that
+    deliberately reaches past this session's own checkout."""
     v = (os.environ.get('WORKSPACE_GUARD_OVERRIDE') or '').strip()
     return v or None
 
@@ -1839,6 +1871,361 @@ def classify_dd(tokens):
     return files
 
 
+# --- Process kills (issue 125) -----------------------------------------------
+# `pkill`/`killall` address a process by *pattern*, not by path, so a pattern
+# naming only the program ("make check", "ginkgo") matches the same process in
+# every checkout on the host — including sibling worktrees of this repo running
+# their own sessions. That is a write to another session's work, addressed the
+# one way the path checks above cannot see.
+#
+# A kill passes only when some operand ANCHORS the pattern to this workspace:
+# the project root's directory name as a whole path component with a path
+# separator on at least one side. A bare word does not count however distinctive
+# it looks — the pattern is a substring match against a command line, not a path,
+# and the hook has no way to judge whether `api` excludes a sibling.
+
+# Flags whose *value* is the following token, so it is not a pattern operand.
+# Both misparse directions are safe: swallowing a real pattern leaves nothing
+# anchored (deny), and mistaking a value for an operand yields an unanchored
+# operand (deny). Precision here buys fewer false denies, never a hole. The
+# union of the procps-ng and BSD/macOS option sets is used, since the hook
+# can't tell which implementation is on PATH.
+KILL_CONSUME = {
+    'pkill': frozenset({
+        '-F', '--pidfile', '-G', '--group', '-J', '-M', '-N', '-P', '--parent',
+        '-T', '-U', '--uid', '-g', '--pgroup', '-j', '-s', '--session',
+        '-t', '--terminal', '-u', '--euid', '--signal', '--ns', '--nslist'}),
+    'killall': frozenset({
+        '-c', '-n', '--ns', '-o', '--older-than', '-s', '--signal',
+        '-t', '-u', '--user', '-y', '--younger-than', '-Z', '--context'}),
+}
+
+# What counts as a path-component name character. A root named `repo` must not
+# anchor inside `repo-branch1`, so `-`, `.` and `_` bind rather than separate.
+KILL_ANCHOR_NAME = 'A-Za-z0-9._-'
+
+
+def classify_pkill(tokens):
+    """For a `pkill`/`killall` command, return `(name, [pattern operands])`.
+
+    Returns None when the command isn't one of them. The operand list is empty
+    for an invocation selecting purely by uid/ppid/session (`pkill -u karl`,
+    `pkill -P 1234`) — still a kill with nothing tying it to this workspace, so
+    the caller denies that too.
+
+    Value-taking flags come off via `KILL_CONSUME`; `--opt=val` splits; `--`
+    ends options; a signal flag (`-9`, `-TERM`) falls through as an ordinary
+    flag and is skipped.
+    """
+    if not tokens:
+        return None
+    name = os.path.basename(tokens[0])
+    consume = KILL_CONSUME.get(name)
+    if consume is None:
+        return None
+    operands = []
+    i, n, end_opts = 1, len(tokens), False
+    while i < n:
+        tok = tokens[i]
+        if not end_opts and tok == '--':
+            end_opts = True; i += 1; continue
+        if not end_opts and tok.startswith('-') and tok != '-':
+            key, inline = split_eq(tok)
+            if key in consume and inline is None:
+                i += 2; continue
+            i += 1; continue
+        operands.append(tok); i += 1
+    return (name, operands)
+
+
+# --- Windows `taskkill` (Q58) ------------------------------------------------
+# Windows' own host-wide kill, and reachable from BOTH frontends — Git Bash
+# spawns it as a native exe, PowerShell as a native command. `taskkill /IM
+# node.exe` is `killall node`, so it earns the same verdict; it needs its own
+# classifier because neither `KILL_CONSUME` nor a PS_SPEC row describes its
+# grammar. Flags take a `/` or a `-` prefix (taskkill accepts both), or `//` once
+# Git Bash's MSYS path mangling has had its say, and their names are
+# case-insensitive. Nothing is positional: every selector is flagged, so a bare
+# word is a syntax error rather than a pattern.
+TASKKILL_CMDS = frozenset({'taskkill'})
+
+# Value-taking flags. `/S` `/U` `/P` address a remote host and are not selection;
+# the other three are.
+TASKKILL_SELECTORS = frozenset({'fi', 'im', 'pid'})
+TASKKILL_CONSUME = TASKKILL_SELECTORS | frozenset({'s', 'u', 'p'})
+
+# A flag rather than an operand. `[A-Za-z?]+` is deliberately tight: it leaves a
+# path-shaped token like `/tmp/x` to be read as an operand, and matches `/?`.
+TASKKILL_FLAG_RE = re.compile(r'^(?:/{1,2}|-)([A-Za-z?]+)$')
+
+
+def native_cmd_name(tok):
+    """Command word normalized the way Windows resolves one: basename,
+    lowercased, `.exe` dropped. `TASKKILL.EXE` and `taskkill` are one command to
+    cmd.exe and to PowerShell alike."""
+    name = os.path.basename(tok).lower()
+    return name[:-4] if name.endswith('.exe') else name
+
+
+def classify_taskkill(words):
+    """For a `taskkill` command, return `(mode, [operand indices])`; else None.
+
+    `mode` is 'pid' when every selector is a literal `/PID <digits>` — the by-pid
+    kill left alone exactly as `kill 1234` and `Stop-Process -Id 1234` are, since
+    it is the rewrite the deny recommends — and 'other' for anything else: an
+    `/IM` image name, an `/FI` filter, a `/PID` the shell expands, or no selector
+    at all. The caller denies an 'other' unless one of the operands anchors.
+
+    Operands come back as INDICES into `words` so each frontend keeps its own
+    token representation: PowerShell's anchor check needs the tokenizer's
+    `expandable` flag, which a list of plain strings would drop.
+
+    Returns None for a help invocation (`taskkill /?`), which kills nothing —
+    the same reason `classify_mktemp` returns None for `--version`.
+    """
+    if not words or native_cmd_name(words[0]) not in TASKKILL_CMDS:
+        return None
+    kinds, operands = set(), []
+    i, n = 1, len(words)
+    while i < n:
+        m = TASKKILL_FLAG_RE.match(words[i])
+        if m is None:
+            kinds.add('other')
+            operands.append(i)
+            i += 1
+            continue
+        key = m.group(1).lower()
+        if key == '?':
+            return None
+        if key not in TASKKILL_CONSUME:
+            i += 1                            # a switch (`/T`, `/F`) or unknown
+            continue
+        if key in TASKKILL_SELECTORS and i + 1 < n:
+            if key == 'pid' and words[i + 1].isdigit():
+                kinds.add('pid')
+            else:
+                kinds.add('other')
+                operands.append(i + 1)
+        i += 2
+    if 'other' in kinds or not kinds:
+        return ('other', operands)
+    return ('pid', [])
+
+
+# --- Pattern-fed kills (issue 125 follow-up) ---------------------------------
+# The deny above names the kill command. The same blind kill dodges it by
+# deriving pids from a pattern instead: `pgrep -f ginkgo | xargs kill`,
+# `kill $(pgrep -f ginkgo)`, `ps … | grep ginkgo | awk '{print $1}' | xargs kill`.
+# Worse, `grep` and `awk` are clean guarded commands, so the whole string used to
+# come back `allow` — the guard green-lit the laundered kill rather than merely
+# missing it.
+#
+# Two rules close it. A signalling command anywhere in the string suppresses the
+# blanket `allow` (a clean guarded command must never speak for a kill); and the
+# pattern operands of the pid *sources* run through the same
+# `kill_operand_anchored` check the kill command's own pattern does.
+#
+# Q60 widened both. The pid source is `ps` itself, not the filter reading it — so
+# a pipeline is caught whatever it filters with, and one with no filter at all
+# (`ps -eo pid= | xargs kill`) is caught too. And `sh -c '<body>'` joins the
+# constructs the hook refuses to vouch for, since the body is one opaque token.
+
+SIGNAL_CMDS = frozenset({'kill', 'pkill', 'killall', 'taskkill'})
+
+# An operand that was demonstrably not derived from a pattern: a literal pid or a
+# job spec (`%1`, `%+`, `%make`). A `kill` whose operands are all of this shape
+# can't be laundering anything, which is what keeps the common safe forms —
+# `kill 1234`, `kill -0 4321` — clear of the rule even when they share a command
+# string with a `pgrep`.
+LITERAL_PID_RE = re.compile(r'^(?:\d+|%[-+%A-Za-z0-9_]*)$')
+
+# grep-family rows whose leading positional is a pattern (see SPEC). `awk` and
+# the other filters are deliberately absent: none of them is the pid source. `ps`
+# is (see below), and the filter only decides which of its rows survive — so a
+# pipeline is caught whatever it filters with, and reading an awk program is
+# never needed. (Q60)
+GREP_LIKE = frozenset({'grep', 'rg'})
+
+# Shells whose `-c` operand is a command string the hook cannot read. The body is
+# one token to the tokenizer, so nothing in it is checked — which means the hook
+# must not speak for it either: a group carrying one clears `guarded`, so the
+# string defers instead of emitting the blanket `allow`. Same principle as the
+# signalling-command suppression above, applied to a second opaque construct.
+# The body itself stays unanalyzed; see README Limitations. (Q60)
+SHELL_C_CMDS = frozenset({'sh', 'bash', 'zsh', 'dash', 'ksh'})
+
+# Stand-in for a grep-family pattern the hook cannot read — `grep -f patterns.txt`
+# takes its patterns from a file, and an invocation may carry no pattern operand
+# at all. It can never anchor, which is the whole point: a grep filtering `ps`
+# output whose pattern is invisible is precisely the case the hook cannot clear,
+# and reporting nothing there would read as "not a pid source".
+UNREADABLE_PATTERN = '(pattern the hook cannot read)'
+
+
+def signal_command(tokens):
+    """For a group that signals a process, return `(name, launderable)`; else None.
+
+    `launderable` marks a kill whose target could have come from a pattern —
+    everything except a `kill` whose operands are all literal pids or job specs.
+    `pkill`/`killall`/`taskkill` are never launderable: they carry their own
+    anchor rule (`classify_pkill`, `classify_taskkill`), and folding them in here
+    would let an unrelated unanchored pattern elsewhere in the string deny a
+    correctly anchored one.
+
+    An `xargs` group is inspected for a signal command word among its tokens
+    rather than parsed for it. Both misparse directions of a real xargs option
+    table are holes (over- and under-consuming can each hide the command word),
+    whereas a plain scan can only over-report — which costs a defer, never a
+    silent allow. A kill hidden inside a quoted `sh -c 'kill …'` is one token and
+    is missed either way; see README Limitations.
+    """
+    if not tokens:
+        return None
+    head = native_cmd_name(tokens[0])
+    if head in SIGNAL_CMDS:
+        if head != 'kill':
+            return (head, False)
+        operands = [t for t in tokens[1:] if not t.startswith('-')]
+        launderable = bool(operands) and not all(
+            LITERAL_PID_RE.match(t) for t in operands)
+        return (head, launderable)
+    if head == 'xargs':
+        for t in tokens[1:]:
+            if native_cmd_name(t) in SIGNAL_CMDS:
+                return (native_cmd_name(t), True)
+    return None
+
+
+def shell_c_group(tokens):
+    """True when the group runs a shell `-c` command string (see SHELL_C_CMDS).
+
+    Every token is scanned rather than just the command word, because the shell
+    is usually not it: `timeout 5 bash -c …`, `xargs -I{} sh -c …` and
+    `find . -exec sh -c … \\;` all carry a body the hook cannot read. A plain
+    scan can only over-report, which costs a defer rather than a silent allow.
+
+    Only a short-option cluster counts as the flag, so `-c`, `-lc` and `-euc`
+    fire while `bash --version` and a long `--config=…` do not.
+    """
+    for i, t in enumerate(tokens):
+        if os.path.basename(t) not in SHELL_C_CMDS:
+            continue
+        if any(u.startswith('-') and not u.startswith('--') and 'c' in u[1:]
+               for u in tokens[i+1:]):
+            return True
+    return False
+
+
+def pgrep_operands(tokens):
+    """Pattern operands of a `pgrep`, or None when the command isn't one.
+
+    `pgrep` and `pkill` share procps-ng's option set — they are one program and
+    one man page — so the extraction is `classify_pkill`'s with `pkill`'s table.
+    """
+    if not tokens or os.path.basename(tokens[0]) != 'pgrep':
+        return None
+    return classify_pkill(['pkill'] + list(tokens[1:]))[1]
+
+
+def grep_pattern_operands(tokens):
+    """Pattern operands of a grep-family command, or None when it isn't one.
+
+    Flags come off the same `SPEC` row `files_in_command` uses, so the two agree
+    about which tokens are values. `-e`/`--regexp` values are collected, and the
+    leading positional counts as a pattern only when no `prog_suppressed_by`
+    flag fired — with `-e` or `-f` present that positional is a FILE, and
+    mistaking a file for a pattern is the unsafe direction: it would let
+    `grep foo wt-a/list.txt` anchor a pipeline it has nothing to do with.
+
+    An **inverting** grep (`-v`) contributes no pattern of its own, only the
+    stand-in: `-v` excludes rather than selects, so its pattern is not what the
+    kill will receive. Counting it would be a hole — `ps … | grep ginkgo |
+    grep -v wt-a/skip | xargs kill` would read as anchored by the exclusion
+    while killing every OTHER checkout's ginkgo.
+
+    Never returns an empty list for a grep-family command: an invocation whose
+    patterns live in a `-f` file (or that carries none at all) yields the
+    `UNREADABLE_PATTERN` stand-in, which can never anchor.
+    """
+    name = ALIASES.get(os.path.basename(tokens[0]), os.path.basename(tokens[0]))
+    if name not in GREP_LIKE:
+        return None
+    spec = SPEC[name]
+    pats, positionals, flags_seen, invert = [], [], set(), False
+    i, n, end_opts = 1, len(tokens), False
+    while i < n:
+        tok = tokens[i]
+        if not end_opts and tok == '--':
+            end_opts = True; i += 1; continue
+        if not end_opts and tok.startswith('-') and tok != '-':
+            key, inline = split_eq(tok)
+            flags_seen.add(key)
+            # `-v` anywhere in a short cluster (`-iv`, `-rv`), and any long form
+            # long enough to be unambiguous (`--inv…`, which GNU grep accepts as
+            # an abbreviation of `--invert-match`).
+            if key.startswith('--'):
+                invert = invert or key.startswith('--inv')
+            else:
+                invert = invert or 'v' in key[1:]
+            if key in ('-e', '--regexp'):
+                if inline is not None:
+                    pats.append(inline); i += 1
+                else:
+                    pats += tokens[i+1:i+2]; i += 2
+                continue
+            if key in spec['file_flags']:
+                cnt = spec['file_flags'][key][0]
+                i += 1 + (0 if inline is not None else cnt); continue
+            if key in spec['consume']:
+                i += 1 + (0 if inline is not None else spec['consume'][key]); continue
+            i += 1; continue
+        positionals.append(tok); i += 1
+    if positionals and not any(f in flags_seen
+                               for f in spec.get('prog_suppressed_by', [])):
+        pats.append(positionals[0])
+    if invert:
+        return [UNREADABLE_PATTERN]
+    return pats or [UNREADABLE_PATTERN]
+
+
+def workspace_anchor_re(proj):
+    """Regex for a path fragment that pins a kill pattern to workspace `proj`.
+
+    Matches the project root's directory name as a whole path component with a
+    path separator on at least one side — `<root>/…`, `…/<root>`, `…/<root>/…`.
+    Returns None when the root has no basename (a filesystem root), which leaves
+    every pattern unanchored.
+    """
+    base = os.path.basename(proj.rstrip('/\\' + os.sep))
+    if not base:
+        return None
+    b = re.escape(base)
+    sep = '[/\\\\]'
+    return re.compile('(?:%s%s(?![%s]))|(?:(?<![%s])%s%s)'
+                      % (sep, b, KILL_ANCHOR_NAME, KILL_ANCHOR_NAME, b, sep))
+
+
+def kill_operand_anchored(tok, anchor, group_cwd, group_cwd_unknown):
+    """True when kill-pattern operand `tok` anchors to this workspace.
+
+    `~`/`~/…` and a leading `$(pwd)` / `$(git rev-parse --show-toplevel)` resolve
+    first — the same forms the file checks resolve — so a pattern written that
+    way anchors like the literal it expands to. A token still carrying an
+    expansion afterwards (`$VAR`, `~user`) can never anchor, however much
+    workspace-shaped text surrounds it: bash decides at runtime where
+    `$HOME/repo/bin` lands, so the `/repo/` in it proves nothing. This is the
+    same unresolvable-means-outside rule `resolve_token` applies to file args.
+    """
+    if anchor is None:
+        return False
+    tok = expand_tilde(tok)
+    if not group_cwd_unknown:
+        tok = resolve_subst_prefix(tok, group_cwd)
+    if tok.startswith('~') or EXPANSION_RE.search(tok):
+        return False
+    return anchor.search(tok) is not None
+
+
 def default_temp_dir():
     """Directory ``mktemp`` (and bash) fall back to when none is given
     explicitly: ``$TMPDIR`` if set, else ``/tmp``. Both are among
@@ -2164,6 +2551,62 @@ def build_sibling_hint(siblings, override=None):
     return lead + body + tail
 
 
+def build_kill_hint(kills, override=None):
+    """One-line guidance for a process kill with no workspace anchor.
+
+    `kills` is a list of `(token, detail)` where `detail` carries the kill
+    command `cmd`, the offending `pattern` (None when the invocation selects by
+    uid/ppid/session — or over a pipeline — with no pattern at all), the
+    workspace `root` to anchor to, and the `shell` whose rewrites to name. A
+    `taskkill` names its own rewrite whichever shell ran it. When
+    `override` is set the kill is downgraded to a prompt rather than blocked, so
+    the wording adjusts.
+    """
+    seen, parts, root, shell = set(), [], '', 'bash'
+    for _, d in kills:
+        root = root or d.get('root') or ''
+        shell = d.get('shell') or shell
+        key = (d.get('cmd'), d.get('pattern'))
+        if key in seen:
+            continue
+        seen.add(key)
+        if d.get('pattern') is None:
+            parts.append("`%s` selects processes with no pattern at all"
+                         % d.get('cmd'))
+        else:
+            parts.append("`%s` pattern `%s` names no path in this workspace"
+                         % (d.get('cmd'), d.get('pattern')))
+    body = "; ".join(parts) + "."
+    if override:
+        lead = ("Unanchored process kill(s) — prompting because "
+                "WORKSPACE_GUARD_OVERRIDE is set (%s): " % override)
+        tail = ""
+    else:
+        lead = ("Unanchored process kill(s) blocked: a pattern that names no "
+                "path in this workspace matches the same process in every "
+                "checkout on this host, so it can kill another session's work. ")
+        if any(d.get('cmd') == 'taskkill' for _, d in kills):
+            # Neither of the other two rewrites is `taskkill`'s: it has no
+            # `pgrep`, and `Stop-Process` is a different command.
+            fix = ('Fix: run `tasklist /FI "IMAGENAME eq <name>"` and '
+                   "`taskkill /PID <pid>` for the one(s) you meant — `/IM` and "
+                   "`/FI` reach that image in every checkout on this host.")
+        elif shell == 'powershell':
+            fix = ("Fix: run `Get-Process <name> | Select-Object Id, Path` and "
+                   "`Stop-Process -Id <pid>` for the one(s) you meant, or filter "
+                   "the pipeline to this workspace first (`Get-Process | "
+                   "Where-Object { $_.Path -like '%s' } | Stop-Process`)."
+                   % os.path.join(root, '*'))
+        else:
+            fix = ("Fix: run `pgrep -fl <pattern>` and kill the pid(s) you "
+                   "meant, or put this workspace's path in the pattern "
+                   "(`%s/…`)." % root)
+        tail = (" " + fix + " For a deliberate cross-workspace kill set "
+                "WORKSPACE_GUARD_OVERRIDE=<reason> to downgrade this to a "
+                "prompt.")
+    return lead + body + tail
+
+
 def offender_display(tok, rp):
     """Display form of an offending file token for the decision reason.
 
@@ -2187,6 +2630,10 @@ def build_reason(offenders, scratch_hint='', override=None):
       * 'sibling'   — a WRITE into a sibling checkout of the same repo (primary
                       checkout or another worktree). `detail` carries the
                       checkout root, branch, and corrected in-session path.
+      * 'kill'      — a `pkill`/`killall`, or a PowerShell `Stop-Process`, with
+                      nothing naming a path in this workspace. `detail` carries
+                      the command, the pattern, the workspace root to anchor to,
+                      and the shell whose rewrites to name.
       * 'hosttemp'  — a path under a host-wide temp root (`/tmp`, `/var/tmp`,
                       `$TMPDIR`). Steered to a repo-local gitignored scratch dir
                       via `scratch_hint` (see build_scratch_hint).
@@ -2200,18 +2647,22 @@ def build_reason(offenders, scratch_hint='', override=None):
     de-duplicated.
     """
     buckets = {'hosttemp': [], 'outside': [], 'expand': [], 'untracked': []}
-    siblings = []
+    siblings, kills = [], []
     for item in offenders:
         tok, cat = item[0], item[1]
         detail = item[2] if len(item) > 2 else None
         if cat == 'sibling':
             siblings.append((tok, detail or {}))
+        elif cat == 'kill':
+            kills.append((tok, detail or {}))
         else:
             buckets[cat].append(tok)
 
     hints = []
     if siblings:
         hints.append(build_sibling_hint(siblings, override))
+    if kills:
+        hints.append(build_kill_hint(kills, override))
     if buckets['hosttemp']:
         hints.append(
             "Host-wide temp path(s): "
@@ -2263,7 +2714,7 @@ def emit(decision, reason):
 Ctx = collections.namedtuple('Ctx', [
     'proj', 'cwd', 'session_id', 'session_tmp_root', 'session_proj_dir',
     'tmp_roots', 'tmp_allow', 'tmp_action', 'read_prefixes', 'session_wt',
-    'sib_override'])
+    'override', 'kill_anchor'])
 
 
 def build_context(data):
@@ -2275,12 +2726,15 @@ def build_context(data):
         allow to THIS session's own task output (empty on older CLIs -> allow off).
       * ``session_tmp_root`` — ``/tmp/claude-<uid>`` realpath.
       * ``session_proj_dir`` — ``<tmp_root>/<slug>`` holding this session, for the
-        sibling-session read exemption (#61); None when not locatable.
+        sibling-session read exemption (#61) and for naming this session's
+        ``scratchpad/`` in the host-temp deny (Q56); None when not locatable.
       * ``tmp_roots`` / ``tmp_allow`` / ``tmp_action`` — host-temp config.
       * ``read_prefixes`` — prefixes always allowed for READS (never writes).
       * ``session_wt`` — the session's own checkout, for the sibling-checkout
         deny; a no-op unless the session is itself a linked worktree.
-      * ``sib_override`` — WORKSPACE_GUARD_OVERRIDE reason, or None.
+      * ``override`` — WORKSPACE_GUARD_OVERRIDE reason, or None.
+      * ``kill_anchor`` — compiled regex a ``pkill``/``killall`` pattern must
+        match to count as scoped to this workspace (issue 125).
     """
     cwd = data.get('cwd') or os.getcwd()
     proj = os.path.realpath(os.environ.get('CLAUDE_PROJECT_DIR') or cwd)
@@ -2295,7 +2749,8 @@ def build_context(data):
         tmp_action=host_temp_action(),
         read_prefixes=allowed_read_prefixes(cwd),
         session_wt=resolve_session_worktree(proj),
-        sib_override=sibling_override())
+        override=guard_override(),
+        kill_anchor=workspace_anchor_re(proj))
 
 
 def path_is_outside(rp, proj):
@@ -2355,17 +2810,21 @@ def decide(offenders, ctx, bypass):
     Shared final step for every handler. ``deny`` when running under
     ``bypassPermissions`` (no human to answer an ask), when a host-temp path is
     hit and the configured action is ``deny``, or when a sibling-checkout write
-    is hit without an override; otherwise ``ask``. Both decisions block equally —
-    this is a recoverability/steering choice, not a weakening of the boundary."""
+    or an unanchored process kill is hit without an override; otherwise ``ask``.
+    Both decisions block equally — this is a recoverability/steering choice, not
+    a weakening of the boundary."""
     host_temp_hit = any(cat == 'hosttemp' for _, cat, _ in offenders)
-    sibling_hit = any(cat == 'sibling' for _, cat, _ in offenders)
-    sibling_deny = sibling_hit and ctx.sib_override is None
+    cross_hit = any(cat in ('sibling', 'kill') for _, cat, _ in offenders)
+    cross_deny = cross_hit and ctx.override is None
     deny_now = bypass or (host_temp_hit and ctx.tmp_action == 'deny') \
-        or sibling_deny
+        or cross_deny
     decision = "deny" if deny_now else "ask"
     reason = build_reason(offenders,
-                          build_scratch_hint(ctx.proj, scratch_dir_name()),
-                          override=ctx.sib_override)
+                          build_scratch_hint(
+                              ctx.proj, scratch_dir_name(),
+                              session_scratchpad(ctx.session_id,
+                                                 ctx.session_proj_dir)),
+                          override=ctx.override)
     return decision, reason
 
 
@@ -2388,6 +2847,18 @@ def resolve_native_path(raw, cwd):
     return os.path.realpath(p if os.path.isabs(p) else os.path.join(cwd, p))
 
 
+# What one command string said about process signalling, merged across its
+# command-substitution bodies (issue 125 follow-up):
+#   signal    — name of a signalling command seen anywhere, else None. Its mere
+#               presence suppresses the blanket `allow`. Also set to `'sh -c'`
+#               by an unreadable shell `-c` body, which the hook must not speak
+#               for either (Q60).
+#   launder   — name of a signalling command whose target could have come from a
+#               pattern (see signal_command), else None.
+#   patterns  — (text, anchored) for every pid-source pattern collected.
+KillFacts = collections.namedtuple('KillFacts', ['signal', 'launder', 'patterns'])
+
+
 def analyze_command(cmd, ctx, base_cwd, depth=0):
     """Analyze one command string against the workspace boundary.
 
@@ -2396,15 +2867,51 @@ def analyze_command(cmd, ctx, base_cwd, depth=0):
     for a guarded-but-clean command). ``base_cwd`` is the cwd file arguments
     resolve against (the tool's cwd at top level).
 
+    This is the public entry point; :func:`_analyze_command` does the work and
+    additionally reports what the string said about process signalling. Two
+    things happen with that here, both of them once for the whole string:
+
+    * ``guarded`` is cleared when anything in the string signals a process, or
+      hides one behind a shell ``-c`` body. A clean guarded command must never
+      speak for either — ``allow`` speaks for the WHOLE string and
+      short-circuits the user's own permission settings, so ``grep x f | xargs
+      kill`` and ``grep x f && sh -c '…'`` defer instead.
+    * A launderable kill whose pid-source patterns ALL fail the workspace anchor
+      test becomes one ``'kill'`` offender, the same category and message
+      ``pkill`` produces. "Any pattern anchors ⇒ no offender" mirrors the
+      ``pkill`` rule, and is what keeps the bare-word pattern of a
+      ``grep -v grep`` stage from denying an otherwise anchored pipeline.
+    """
+    offenders, guarded, kf = _analyze_command(cmd, ctx, base_cwd, depth)
+    if kf.launder and kf.patterns and not any(a for _, a in kf.patterns):
+        texts = list(dict.fromkeys(t for t, _ in kf.patterns))
+        named = [t for t in texts if t != UNREADABLE_PATTERN]
+        offenders.append((kf.launder, 'kill', {
+            'cmd': kf.launder, 'root': ctx.proj,
+            'pattern': ', '.join(named or texts)}))
+    return offenders, guarded and not kf.signal
+
+
+def _analyze_command(cmd, ctx, base_cwd, depth=0):
+    """Analyze one command string; returns ``(offenders, guarded, KillFacts)``.
+
     Command-substitution bodies (``"$(…)"`` and backtick ``` `…` ```, plus the
     bare ``$(…)`` the group loop also splits out) are recursively analyzed and
     their offenders folded in — but their ``guarded`` flag is DISCARDED, so a
     clean guarded command inside a substitution never flips a deferring outer
     command into an ``allow``. Substitution analysis is strictly friction-adding.
+
+    Their KillFacts DO fold in, because the two halves of a laundered kill can
+    sit on opposite sides of the recursion: in ``kill "$(pgrep -f ginkgo)"`` the
+    quoting hides the source from the outer tokenizer, and neither half is an
+    offender on its own.
     """
     proj, cwd = ctx.proj, base_cwd
+    # Kept under its own name because the group loop below reuses `depth` as the
+    # paren-nesting counter, clobbering the parameter.
+    subst_depth = depth
     if not cmd.strip():
-        return [], False
+        return [], False, KillFacts(None, None, [])
 
     try:
         # `\n` is a punctuation char so a newline command boundary surfaces as
@@ -2427,9 +2934,9 @@ def analyze_command(cmd, ctx, base_cwd, depth=0):
         lex.commenters = ''
         tokens = glue_dollar_paren(split_operator_runs(list(lex)))
     except ValueError:
-        return [], False                          # unbalanced quotes -> defer
+        return [], False, KillFacts(None, None, [])   # unbalanced quotes -> defer
 
-    # Each group is a `(cmd_tokens, redir_targets, persists)` triple: a
+    # Each group is a `(cmd_tokens, redir_targets, persists, pipe)` tuple: a
     # redirect target is collected into the group it textually appears in, so
     # it later resolves against THAT group's cwd rather than the chain's
     # original cwd — this is what lets `cd /tmp && cat /dev/null > evil` flag
@@ -2437,21 +2944,25 @@ def analyze_command(cmd, ctx, base_cwd, depth=0):
     # the group survives into later commands of the same string: at paren
     # depth 0 (not a subshell — `(f=x); cat $f` doesn't set f), not a pipeline
     # segment (each side of `|` runs in a subshell), and not backgrounded
-    # (`f=x & …` assigns in the background copy only).
+    # (`f=x & …` assigns in the background copy only). `pipe` numbers the
+    # pipeline the group belongs to, which is what tells a `grep` filtering `ps`
+    # output apart from a `grep` reading ordinary files.
     groups, cur, cur_redir, i = [], [], [], 0
-    depth, prev_sep = 0, ''
+    depth, prev_sep, pipe = 0, '', 0
     while i < len(tokens):
         t = tokens[i]
         if t in SEPARATORS:
             if cur or cur_redir:
                 persists = (depth == 0 and prev_sep != '|'
                             and t in (';', '\n', '&&', '||'))
-                groups.append((cur, cur_redir, persists))
+                groups.append((cur, cur_redir, persists, pipe))
                 cur, cur_redir = [], []
             if t == '(':
                 depth += 1
             elif t == ')':
                 depth = max(0, depth - 1)
+            if t != '|':
+                pipe += 1
             prev_sep = t
             i += 1; continue
         if t in REDIR or t in DUP:
@@ -2483,7 +2994,7 @@ def analyze_command(cmd, ctx, base_cwd, depth=0):
             i += 1; continue
         cur.append(t); i += 1
     if cur or cur_redir:
-        groups.append((cur, cur_redir, depth == 0 and prev_sep != '|'))
+        groups.append((cur, cur_redir, depth == 0 and prev_sep != '|', pipe))
 
     def is_outside(rp):
         return path_is_outside(rp, proj)
@@ -2628,7 +3139,15 @@ def analyze_command(cmd, ctx, base_cwd, depth=0):
     # later `$NAME` in a file arg is checked against every value bash iterates.
     # Poisoned by the same reassignment/`read`/`eval` rules as varmap (below).
     loopmap = {}
-    for g, g_redir, persists in groups:
+    # Process-signalling facts for this string (issue 125 follow-up). Grep
+    # patterns are held with their pipeline number and only promoted to pid
+    # sources after the loop, so a `ps` segment counts wherever in its pipeline
+    # it sits rather than only before the grep.
+    signal, launder, patterns = None, None, []
+    # `kill_pipes` numbers the pipelines holding a launderable kill, so a `ps`
+    # only counts as that kill's pid source when pids can actually reach it.
+    ps_pipes, grep_pats, kill_pipes = set(), [], set()
+    for g, g_redir, persists, pipe in groups:
         # Substitute known literals for path checking. The pre-substitution
         # tokens are kept for assignment parsing below — bash decides what is
         # an assignment before expansion.
@@ -2681,6 +3200,29 @@ def analyze_command(cmd, ctx, base_cwd, depth=0):
                 poison_vars(sub_g, loopmap)       # same rules invalidate loops
         g = strip_env_prefix(kw_g)
         if not g: continue                        # keyword/env-only or redirect-only group
+        # Signalling and pid-source classification runs before every `continue`
+        # below, so no command shape can skip past it.
+        sig = signal_command(g)
+        if sig is not None:
+            signal = signal or sig[0]
+            if sig[1]:
+                launder = launder or sig[0]
+                kill_pipes.add(pipe)
+        elif shell_c_group(g):
+            # An unreadable command string: suppress `allow` the same way a
+            # signalling command does. Checked in the `elif` so a group that is
+            # BOTH (`xargs sh -c 'kill …'`) keeps its signal classification.
+            signal = signal or 'sh -c'
+        if os.path.basename(g[0]) == 'ps':
+            ps_pipes.add(pipe)
+        pg = pgrep_operands(g)
+        gp = grep_pattern_operands(g) if pg is None else None
+        for p in (pg or []):
+            patterns.append((p, kill_operand_anchored(
+                p, ctx.kill_anchor, group_cwd, group_cwd_unknown)))
+        for p in (gp or []):
+            grep_pats.append((pipe, p, kill_operand_anchored(
+                p, ctx.kill_anchor, group_cwd, group_cwd_unknown)))
         kind, arg = classify_cd(g)
         if kind is not None:
             if kind == 'arg':
@@ -2724,6 +3266,36 @@ def analyze_command(cmd, ctx, base_cwd, depth=0):
                 if o is not None:
                     outside.append(o)
             continue
+        kl = classify_pkill(g)
+        if kl is not None:
+            # A kill is not a file op, so it never sets `guarded`: an anchored
+            # pattern DEFERS rather than emitting `allow`, leaving the user's own
+            # permission settings to have their say on a destructive command.
+            # An unanchored one is an offender the decision layer denies.
+            name, operands = kl
+            if not any(kill_operand_anchored(o, ctx.kill_anchor, group_cwd,
+                                             group_cwd_unknown)
+                       for o in operands):
+                outside.append((g[0], 'kill', {
+                    'cmd': name, 'root': proj,
+                    'pattern': ' '.join(operands) if operands else None}))
+            continue
+        tk = classify_taskkill(g)
+        if tk is not None:
+            # Same category and the same reason `guarded` stays clear as the
+            # `pkill` branch above. The anchor scan is this command's own tokens:
+            # `taskkill` reads no pipeline, so an anchor written upstream of it
+            # cannot be what selects the processes.
+            mode, idx = tk
+            operands = [g[i] for i in idx]
+            if mode != 'pid' and not any(
+                    kill_operand_anchored(o, ctx.kill_anchor, group_cwd,
+                                          group_cwd_unknown)
+                    for o in operands):
+                outside.append((g[0], 'kill', {
+                    'cmd': 'taskkill', 'root': proj,
+                    'pattern': ' '.join(operands) if operands else None}))
+            continue
         fs = files_in_command(g)
         if fs is None: continue
         guarded = True
@@ -2741,6 +3313,34 @@ def analyze_command(cmd, ctx, base_cwd, depth=0):
             o = check_file(f, group_cwd, group_cwd_unknown, is_read=f_is_read)
             if o is not None:
                 outside.append(o)
+
+    # A grep's pattern is a pid source only when it filters `ps` output, which is
+    # a property of the whole pipeline — resolved here so a `ps` segment counts
+    # wherever in its pipeline it sits, not only before the grep.
+    for grep_pipe, text, anchored in grep_pats:
+        if grep_pipe in ps_pipes:
+            patterns.append((text, anchored))
+
+    # `ps` is itself a pid source, and an unreadable one — the hook is not going
+    # to parse `-eo` format strings. Contributing the stand-in is what catches a
+    # pipeline whose filter is not a grep (`awk '/x/ {print $1}'`, `sed -n`,
+    # `cut -f1`) and one with no filter at all (`ps -eo pid= | xargs kill`),
+    # without reading any filter program. A readable grep pattern in the same
+    # pipeline still ANCHORS it, under the unchanged any-pattern-anchors rule.
+    #
+    # Unlike a grep pattern, which is promoted string-wide, this needs the pids
+    # to be able to REACH the kill: a grep pattern is readable, so an unanchored
+    # one is evidence of intent to select processes by name wherever it sits,
+    # whereas a bare `ps` says nothing until it is wired to a kill. So it counts
+    # in the launderable kill's own pipeline, or anywhere inside a substitution
+    # body (whose output the enclosing command consumes by definition, which is
+    # what catches `kill $(ps -eo pid= | head -1)`).
+    #
+    # That requirement is load-bearing: without it the rule denies the commonest
+    # debugging idiom there is — `./run.sh & p=$!; kill $p; ps -p $p` — where the
+    # `ps` is a CONSUMER of an already-known pid, in its own group. (Q60)
+    if (ps_pipes & kill_pipes) or (subst_depth > 0 and ps_pipes):
+        patterns.append((UNREADABLE_PATTERN, False))
 
     # Recurse into command-substitution bodies — `"$(mktemp)"`, backtick
     # `` `cat /outside` ``, and the bare `$(…)` the group loop also split out
@@ -2763,9 +3363,12 @@ def analyze_command(cmd, ctx, base_cwd, depth=0):
         for hd in heredocs:
             subs.extend(command_substitutions(hd, quotes=False))
         for body in subs:
-            sub_off, _ = analyze_command(body, ctx, base_cwd, depth + 1)
+            sub_off, _, sub_kf = _analyze_command(body, ctx, base_cwd, depth + 1)
             outside.extend(sub_off)
-    return outside, guarded
+            signal = signal or sub_kf.signal
+            launder = launder or sub_kf.launder
+            patterns.extend(sub_kf.patterns)
+    return outside, guarded, KillFacts(signal, launder, patterns)
 
 
 def handle_bash(data):
@@ -2781,7 +3384,13 @@ def handle_bash(data):
     # non-empty even when `guarded` is False: a redirect target is a shell-level
     # write the hook resolves regardless of the command word, so `echo secret >
     # /tmp/x` (host-temp) and `ls > /outside` are honored here rather than
-    # discarded by an earlier guarded-only gate (Q26).
+    # discarded by an earlier guarded-only gate (Q26). An unanchored `pkill`
+    # arrives the same way — it has no file argument to guard, and an anchored
+    # one deliberately leaves `guarded` False so it defers instead of allowing.
+    # For the same reason `analyze_command` clears `guarded` whenever anything in
+    # the string signals a process: `allow` speaks for the WHOLE string, so a
+    # clean `grep` must never carry an `xargs kill` past the user's own
+    # permission settings.
     if not outside and not guarded:
         return
 
@@ -2805,10 +3414,12 @@ def handle_bash(data):
         # are equally blocking — this is a recoverability/steering choice, not a
         # weakening of the boundary.
         #
-        # A third deny driver: a WRITE into a sibling checkout of the same repo
-        # (the 'sibling' category). It denies by default — self-heals in one
-        # agent round trip — unless WORKSPACE_GUARD_OVERRIDE is set, which
-        # downgrades it to `ask` for deliberate cross-checkout work.
+        # Two more deny drivers reach past this session's own checkout: a WRITE
+        # into a sibling checkout of the same repo (the 'sibling' category), and
+        # a `pkill`/`killall` whose pattern names no path in this workspace (the
+        # 'kill' category). Both deny by default — they self-heal in one agent
+        # round trip — unless WORKSPACE_GUARD_OVERRIDE is set, which downgrades
+        # them to `ask` for deliberate cross-workspace work.
         bypass = data.get("permission_mode") == "bypassPermissions"
         decision, reason = decide(outside, ctx, bypass)
     else:
@@ -3028,7 +3639,37 @@ PS_ALIASES = {
     'rni': 'rename-item', 'ren': 'rename-item',
     'cd': 'set-location', 'sl': 'set-location', 'chdir': 'set-location',
     'pushd': 'push-location', 'popd': 'pop-location',
+    'spps': 'stop-process', 'kill': 'stop-process',
 }
+
+# --- PowerShell process kills (Q57) ------------------------------------------
+# `Stop-Process` is this shell's `pkill`, and the bash section on issue 125 gives
+# the reasoning: a kill selected by process name, or fed by an unfiltered
+# pipeline, reaches that process in every checkout on the host. Its own rule
+# rather than a PS_SPEC row, because nothing here is a file path — selection is
+# by name, by pid, or by piped object.
+PS_KILL_CMDS = frozenset({'stop-process'})
+
+# The three selectors, and the verdict each earns:
+#   -Id           kill by pid. Untouched, exactly as the bash side leaves
+#                 `kill <pid>` alone — it is the rewrite the deny recommends.
+#   -Name         `killall`. Denied outright: a process name carries no path, so
+#                 nothing in the statement can scope it to this workspace.
+#   -InputObject  the processes came from somewhere the hook can see, so the
+#                 rest of the statement is where an anchor may appear. Bare
+#                 pipeline input (no selector at all) reads the same way.
+PS_KILL_SELECTORS = frozenset({'id', 'name', 'inputobject'})
+PS_KILL_SPEC = _ps_row(
+    {},                                   # nothing here names a file
+    consume=tuple(PS_KILL_SELECTORS),
+    switches=('force', 'passthru'))
+
+# A kill is judged over the whole STATEMENT, not one pipeline segment: the
+# anchored rewrite is `Get-Process | Where-Object { $_.Path -like '<root>\*' } |
+# Stop-Process`, where the anchor sits two segments upstream of the kill. So `|`,
+# `(`/`)` and `{`/`}` all stay inside the scope and only these end it.
+PS_STATEMENT_OPS = frozenset({';', '\n', '&&', '||', '&'})
+
 
 # `@"` / `@'` opens a here-string; the body ends at a line whose first
 # non-blank characters are the closing delimiter.
@@ -3458,6 +4099,161 @@ def ps_apply_location(words, cwd, cwd_unknown):
     return ps_realpath(p, cwd), False
 
 
+def ps_strip_head(words):
+    """Drop an assignment prefix or the dot-source operator, so the command word
+    is at index 0 — `$out = Get-Content …` heads on Get-Content."""
+    if words and words[0][1].startswith('$'):
+        if len(words) > 1 and words[1][1] == '=':
+            words = words[2:]
+        elif words[0][1].endswith('='):
+            words = words[1:]
+    if words and words[0][1] == '.':        # dot-source operator
+        words = words[1:]
+    return words
+
+
+def ps_pid_list(tok):
+    """True when `tok` is a literal pid or a comma-joined list of them."""
+    return all(p.isdigit() for p in tok.split(','))
+
+
+def ps_classify_kill(words):
+    """Classify a `Stop-Process` segment, or None when it isn't one.
+
+    Returns `(mode, selectors)` with mode 'pid' (every selector is a literal
+    process id — nothing to guard), 'name' (`-Name` was used, which no anchor can
+    rescue), or 'other' (anchorable by the rest of the statement).
+
+    An `-Id` value carrying a `$` is NOT the pid case: after `$p = Get-Process
+    -Name node`, `Stop-Process -Id $p.Id` is host-wide and the hook can't see the
+    difference. Only literal digits count.
+    """
+    if not words:
+        return None
+    name = PS_ALIASES.get(words[0][1].lower(), words[0][1].lower())
+    if name not in PS_KILL_CMDS:
+        return None
+    kinds, selectors = set(), []
+
+    def take(key, val, exp):
+        if key == 'id' and not exp and ps_pid_list(val):
+            kinds.add('pid')
+            return
+        kinds.add('name' if key == 'name' else 'other')
+        selectors.append(val)
+
+    i, n, verbatim = 1, len(words), False
+    while i < n:
+        _, val, exp, _ = words[i]
+        if val == '--%':
+            # Stop-parsing: the tail goes to the target verbatim, so the hook
+            # reads it as selection it cannot vouch for rather than as flags.
+            verbatim = True
+            i += 1
+            continue
+        if not verbatim and len(val) > 1 and val[0] == '-' and not exp \
+                and not val[1].isdigit() and val[1] != '.':
+            pname, attached = val[1:], None
+            if ':' in pname:              # `-Name:node` binds without a space
+                pname, attached = pname.split(':', 1)
+            key = ps_resolve_param(pname.lower(), PS_KILL_SPEC)
+            if key in PS_KILL_SELECTORS:
+                if attached is not None:
+                    take(key, attached, exp)
+                elif i + 1 < n:
+                    take(key, words[i + 1][1], words[i + 1][2])
+                    i += 1
+            elif key in PS_KILL_SPEC['consume'] and attached is None:
+                i += 1                    # an ordinary value-taking parameter
+            i += 1
+            continue
+        take('id', val, exp)              # positional 0 is -Id, else -InputObject
+        i += 1
+
+    if 'name' in kinds:
+        return 'name', selectors
+    if 'other' in kinds or not kinds:     # no selector at all -> pipeline input
+        return 'other', selectors
+    return 'pid', selectors
+
+
+def ps_kill_operand_anchored(tok, expandable, anchor):
+    """True when statement token `tok` pins a `Stop-Process` to this workspace.
+
+    Same anchor as the bash side — the project root's directory name as a whole
+    path component — with PowerShell's resolution rules in front of it. The
+    tokenizer's `expandable` flag stands in for `EXPANSION_RE`: `ps_subexpressions`
+    has already reduced a `$(…)` to a bare `$`, and PowerShell decides at runtime
+    where `$env:USERPROFILE\\repo\\bin` lands, so the `\\repo\\` in it proves
+    nothing.
+    """
+    if anchor is None or expandable:
+        return False
+    p = ps_expand_tilde(tok)
+    if p.startswith('~'):
+        return False
+    return anchor.search(p) is not None
+
+
+def ps_statement_kills(segments, ctx):
+    """Offenders for the unanchored `Stop-Process` calls in one statement, and
+    whether the statement signalled a process at all.
+
+    `segments` is the statement's pipeline segments, each a token list. The
+    anchor is looked for across all of them because the anchored rewrite is a
+    pipeline (see PS_STATEMENT_OPS). A `-Name` kill is exempt from that scan —
+    no amount of surrounding text scopes a bare process name to this workspace.
+
+    The signal flag counts a kill that earns no offender — one by literal pid,
+    or one the anchor cleared — because suppressing the caller's blanket `allow`
+    is exactly what those cases need (Q59).
+
+    A `taskkill` segment is judged here too, but on its OWN tokens: it reads no
+    pipeline, so an anchor upstream of it selects nothing it kills. It shares
+    this function only so one place answers "did this statement signal" (Q58).
+    """
+    kills, signal, offenders = [], False, []
+    for seg in segments:
+        words = ps_strip_head([t for t in seg if t[0] == 'word'])
+        tk = classify_taskkill([w[1] for w in words])
+        if tk is not None:
+            signal = True
+            offenders.extend(ps_taskkill_offenders(words, tk, ctx))
+            continue
+        kl = ps_classify_kill(words)
+        if kl is None:
+            continue
+        signal = True
+        if kl[0] != 'pid':
+            kills.append(kl)
+    if not kills:
+        return offenders, signal
+    anchored = any(ps_kill_operand_anchored(t[1], t[2], ctx.kill_anchor)
+                   for seg in segments for t in seg if t[0] == 'word')
+    offenders += [('Stop-Process', 'kill',
+                   {'cmd': 'Stop-Process', 'root': ctx.proj, 'shell': 'powershell',
+                    'pattern': ' '.join(selectors) or None})
+                  for mode, selectors in kills if mode == 'name' or not anchored]
+    return offenders, signal
+
+
+def ps_taskkill_offenders(words, tk, ctx):
+    """Offenders for a `taskkill` segment already classified as `tk`.
+
+    The bash frontend runs the same rule over the same operands; only the
+    resolution differs, so the anchor check is PowerShell's and the verdict is
+    identical for a given command.
+    """
+    mode, idx = tk
+    if mode == 'pid' or any(
+            ps_kill_operand_anchored(words[i][1], words[i][2], ctx.kill_anchor)
+            for i in idx):
+        return []
+    return [(words[0][1], 'kill',
+             {'cmd': 'taskkill', 'root': ctx.proj, 'shell': 'powershell',
+              'pattern': ' '.join(words[i][1] for i in idx) or None})]
+
+
 def ps_analyze_segment(tokens, ctx, cwd, cwd_unknown):
     """Analyze one pipeline segment. Returns `(offenders, guarded, cwd,
     cwd_unknown)` — the trailing pair carries location tracking to the next
@@ -3478,15 +4274,7 @@ def ps_analyze_segment(tokens, ctx, cwd, cwd_unknown):
         words.append(tokens[i])
         i += 1
 
-    # `$out = Get-Content …` — drop the assignment so the cmdlet is the head.
-    if words and words[0][1].startswith('$'):
-        if len(words) > 1 and words[1][1] == '=':
-            words = words[2:]
-        elif words[0][1].endswith('='):
-            words = words[1:]
-    if words and words[0][1] == '.':        # dot-source operator
-        words = words[1:]
-
+    words = ps_strip_head(words)
     guarded = False
     if words:
         name = PS_ALIASES.get(words[0][1].lower(), words[0][1].lower())
@@ -3523,20 +4311,35 @@ def ps_analyze_segment(tokens, ctx, cwd, cwd_unknown):
 def ps_analyze_command(cmd, ctx, base_cwd, depth=0):
     """Analyze a PowerShell command string. Returns `(offenders, guarded)`,
     matching `analyze_command`'s contract so the two frontends share the
-    emit logic below."""
+    emit logic below.
+
+    `guarded` is cleared when anything in the string signals a process, for the
+    reason the bash side clears it: `allow` speaks for the WHOLE string and
+    short-circuits the user's own permission settings, so a clean `Get-Content`
+    must never speak for a `Stop-Process` sharing the string with it — including
+    the kills the decision layer had no cause to deny, by literal pid or
+    anchored. Those defer instead, which is the posture an anchored kill on its
+    own already gets. (Q59)
+    """
+    offenders, guarded, signal = _ps_analyze_command(cmd, ctx, base_cwd, depth)
+    return offenders, guarded and not signal
+
+
+def _ps_analyze_command(cmd, ctx, base_cwd, depth=0):
+    """Analyze one PowerShell string; returns `(offenders, guarded, signal)`."""
     if not cmd.strip():
-        return [], False
+        return [], False, False
     expandable_text = ps_strip_here_strings(cmd, literal_only=True)
     stripped = ps_strip_here_strings(cmd)
     if expandable_text is None or stripped is None:
-        return [], False                      # open here-string -> defer
+        return [], False, False               # open here-string -> defer
     bodies = ps_subexpressions(expandable_text)[1]
     toks = ps_tokenize(ps_subexpressions(stripped)[0])
     if toks is None:
-        return [], False                      # open quote -> defer
+        return [], False, False               # open quote -> defer
 
-    offenders, guarded = [], False
-    cwd, cwd_unknown, seg = base_cwd, False, []
+    offenders, guarded, signal = [], False, False
+    cwd, cwd_unknown, seg, stmt = base_cwd, False, [], []
     for tok in toks + [('op', ';', False, False)]:
         if tok[0] == 'op':
             if seg:
@@ -3544,17 +4347,33 @@ def ps_analyze_command(cmd, ctx, base_cwd, depth=0):
                     seg, ctx, cwd, cwd_unknown)
                 offenders.extend(off)
                 guarded = guarded or g
+                stmt.append(seg)
             seg = []
+            # A kill never sets `guarded` itself, and clears anyone else's: an
+            # anchored one defers rather than emitting `allow`, leaving the
+            # user's own permission settings to have their say on a destructive
+            # command.
+            if tok[1] in PS_STATEMENT_OPS:
+                off, sig = ps_statement_kills(stmt, ctx)
+                offenders.extend(off)
+                signal = signal or sig
+                stmt = []
         else:
             seg.append(tok)
 
     # Subexpression bodies contribute offenders only — a clean guarded cmdlet
-    # inside one never flips a deferring outer command into an `allow`.
+    # inside one never flips a deferring outer command into an `allow`. Their
+    # signal DOES fold up, because `ps_subexpressions` masks the body out of the
+    # outer text entirely: in `Get-Content .\in.txt; $(Stop-Process -Id 1234)`
+    # the two halves sit on opposite sides of this recursion, and neither is an
+    # offender on its own.
     if depth < MAX_SUBST_DEPTH:
         for body in bodies:
-            offenders.extend(ps_analyze_command(body, ctx, base_cwd,
-                                                depth + 1)[0])
-    return offenders, guarded
+            sub_off, _, sub_sig = _ps_analyze_command(body, ctx, base_cwd,
+                                                      depth + 1)
+            offenders.extend(sub_off)
+            signal = signal or sub_sig
+    return offenders, guarded, signal
 
 
 def handle_powershell(data):

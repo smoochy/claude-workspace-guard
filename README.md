@@ -1,6 +1,6 @@
 # workspace-guard
 
-**Path-aware shell permissions for Claude Code.**
+**Workspace-boundary shell permissions for Claude Code.**
 
 [![release](https://img.shields.io/github/v/release/karlkfi/claude-workspace-guard)](https://github.com/karlkfi/claude-workspace-guard/releases) [![tests](https://img.shields.io/github/actions/workflow/status/karlkfi/claude-workspace-guard/tests.yml?branch=main&label=tests)](https://github.com/karlkfi/claude-workspace-guard/actions/workflows/tests.yml) [![License: MIT](https://img.shields.io/github/license/karlkfi/claude-workspace-guard.svg)](LICENSE) [![Claude Code plugin](https://img.shields.io/badge/Claude_Code-plugin-7e57c2)](#install)
 
@@ -16,7 +16,10 @@ workspace-guard is a `PreToolUse` hook for the shell tools (`Bash` and
 `PowerShell`) — and for Claude's native file tools (`Read`, `Grep`, `Glob`,
 `Edit`, `Write`, …) — that parses the command, finds its file arguments, and
 asks for confirmation only when a path resolves outside your project root
-(`$CLAUDE_PROJECT_DIR`). In-repo reads and pure pipelines run silently.
+(`$CLAUDE_PROJECT_DIR`). In-repo reads and pure pipelines run silently. A path is
+the main way out of that boundary but not the only one, so the same rule covers
+`pkill` and `Stop-Process`, which reach another checkout's processes by pattern
+instead.
 
 ![Claude Code's permission prompt when grep targets a file outside the project root](docs/img/ask-prompt.png)
 
@@ -47,8 +50,10 @@ The hook produces one of four outcomes:
   shared across every session and worktree and live outside the project root, so
   instead of prompting, the hook steers you to a repo-local gitignored scratch
   dir (`./tmp/`). It's also the default for **writes into a sibling checkout of
-  the same repo** when the session runs in a git worktree (see below).
-  Configurable down to `ask`; see [Configuration](#configuration).
+  the same repo** when the session runs in a git worktree, and for a
+  **process kill that names no path in this workspace** — whether the pattern is
+  the kill's own (`pkill -f`) or reached it through a `pgrep` or a `ps` pipeline
+  (all below). Configurable down to `ask`; see [Configuration](#configuration).
 - **defer** — the hook stays silent; your normal permission settings apply.
 
 Guarded commands: `grep` (and `egrep`, `fgrep`), `rg`, `sed`, `awk` (and
@@ -64,6 +69,12 @@ aren't covered yet (see [`docs/STATUS.md`](docs/STATUS.md)). A **redirect**
 target (`> file`) is checked on *any* command, guarded or not — it's a write the
 shell performs regardless of the command word.
 
+Process kills are guarded too, though they touch no file: `pkill`/`killall`,
+PowerShell's `Stop-Process`, and Windows' `taskkill` signal a process by
+*pattern* or by *name*, which reaches every checkout on the host — and so does a
+`kill` fed pids by a `pgrep` or by a `ps` pipeline, whatever it filters with. See
+[Unanchored process-kill deny](#unanchored-process-kill-deny).
+
 The same outside-workspace check also runs on Claude's **native file tools**, so
 the guard can't be sidestepped by switching from a bash command to the
 equivalent tool — `Read`-ing `/etc/passwd` prompts exactly like `cat /etc/passwd`
@@ -72,14 +83,18 @@ exemptions below); `Edit`, `Write`, `MultiEdit`, and `NotebookEdit` are treated
 as writes. See [Beyond Bash](#beyond-bash-native-file-tools).
 
 It also stays quiet for paths that aren't really "outside your project":
-`/dev/null` and friends, and the session's **own** background-task output under
-`/tmp/claude-<uid>/…` that the agent polls with `cat`/`tail`/`grep`. So
-sessions that spawn and manage background work aren't spammed with prompts for
-reading their own output — in real usage that one case accounted for ~37% of
-all prompts. Read-only commands may also poll a **sibling** session's output
-under the same project's scratch dir — the dispatcher-tails-workers pattern of
-parallel dispatch. Writing into another session's scratch still asks, and a
-different project's scratch still asks entirely.
+`/dev/null` and friends, and the session's **own** Claude-managed scratch tree
+under `/tmp/claude-<uid>/…/<session>/…` — both the background-task output the
+agent polls with `cat`/`tail`/`grep` and the `scratchpad/` dir Claude Code
+points the session at for temp files. That whole tree is exempt for **reads and
+writes alike**: Claude Code chose the path and cleans it up, so a throwaway that
+shouldn't outlive the session belongs there. Sessions that spawn and manage
+background work therefore aren't spammed with prompts for reading their own
+output — in real usage that one case accounted for ~37% of all prompts.
+Read-only commands may also poll a **sibling** session's output under the same
+project's scratch dir — the dispatcher-tails-workers pattern of parallel
+dispatch. Writing into another session's scratch still asks, and a different
+project's scratch still asks entirely.
 
 | Command                              | Decision |
 | ------------------------------------ | -------- |
@@ -108,6 +123,7 @@ different project's scratch still asks entirely.
 | `cd "$(git rev-parse --show-toplevel)" && cat README.md` | allow |
 | `cd "$(pwd)" && cat README.md`       | allow    |
 | `tail /tmp/claude-501/…/<this-session>/…` (own task output) | allow |
+| `echo x > /tmp/claude-501/…/<this-session>/scratchpad/f` (own scratch write) | allow |
 | `tail /tmp/claude-501/<this-project>/<sibling-session>/…` (sibling read) | allow |
 | `f=notes.md; cat $f`                 | allow    |
 | `d=sub; cd $d && cat x.txt`          | allow    |
@@ -161,6 +177,29 @@ different project's scratch still asks entirely.
 | `mktemp -dp ./scratch x.XXXX` (clustered `-d -p`) | allow |
 | `cat /tmpfoo/x` (not under `/tmp`)   | **ask**  |
 | `ls > /etc/out.txt` (unguarded redirect, outside) | **ask** |
+| `pkill -f ginkgo` · `pkill -f "make check"` | **deny** |
+| `pkill -f "<sibling-worktree>/bin/x"` | **deny** |
+| `pkill -u karl` (no pattern at all)  | **deny** |
+| `killall node`                       | **deny** |
+| `pkill -f "<this-root>/.build/ginkgo"` (anchored) | defer |
+| `kill $(pgrep -f ginkgo)` · `pgrep -f ginkgo \| xargs -r kill` | **deny** |
+| `ps -eo pid,command \| grep ginkgo \| awk '{print $1}' \| xargs kill` | **deny** |
+| `ps -eo pid,command \| awk '/ginkgo/ {print $1}' \| xargs kill` | **deny** |
+| `ps -eo pid= \| xargs kill` (no filter at all) | **deny** |
+| `kill $(ps -eo pid= \| head -1)`     | **deny** |
+| `for p in $(pgrep -f ginkgo); do kill $p; done` | **deny** |
+| `pgrep -f "<this-root>/bin/x" \| xargs -r kill` (anchored) | defer |
+| `taskkill //IM node.exe` · `taskkill //FI "IMAGENAME eq node.exe"` | **deny** |
+| `taskkill` (no selector at all)      | **deny** |
+| `taskkill //PID 1234` · `taskkill /?` | defer   |
+| `ps aux \| grep "<this-root>/bin/x" \| awk '{print $1}' \| xargs kill` | defer |
+| `kill 1234` · `kill -0 1234` · `kill $pid` | defer |
+| `./run.sh & p=$!; kill $p; ps -p $p` (ps consumes a pid) | defer |
+| `pgrep -fl ginkgo` · `pgrep -f ginkgo; kill 1234` | defer |
+| `cat in.txt && kill 1234` (clean read, but signals) | defer |
+| `cat in.txt; sh -c '…'` (clean read, opaque body) | defer |
+| `ps aux \| grep ginkgo` (no kill in the string) | allow |
+| `cat in.txt; bash --version` (shell, no `-c` body) | allow |
 | `ls /etc` (unguarded, no redirect)   | defer    |
 | `mktemp --version` (creates nothing) | defer    |
 | `echo '$(mktemp -d)'` (single-quoted, no subst) | defer |
@@ -205,6 +244,8 @@ Guarded cmdlets: `Get-Content`, `Select-String`, `Import-Csv`, `Import-Clixml`,
 `Set-Content`, `Add-Content`, `Out-File`, `Tee-Object`, `Export-Csv`,
 `Export-Clixml`, `Copy-Item`, `Move-Item`, `Remove-Item`, `Rename-Item`, and
 their aliases. Output redirects (`>`, `>>`, `2>`) are checked on any command.
+`Stop-Process` (and `kill`, `spps`) is guarded as well, as a process kill, as is
+Windows' own `taskkill`.
 
 | Command                                        | Decision |
 | ---------------------------------------------- | -------- |
@@ -223,6 +264,14 @@ their aliases. Output redirects (`>`, `>>`, `2>`) are checked on any command.
 | `Write-Output hi > C:\out\x` (redirect)        | **ask**  |
 | `Write-Output "$(Get-Content C:\out\x)"`       | **ask**  |
 | `Get-Content $env:USERPROFILE\x`               | **ask**  |
+| `Stop-Process -Name node`                      | **deny** |
+| `Get-Process node \| Stop-Process`              | **deny** |
+| `Stop-Process -Id $p.Id`                       | **deny** |
+| `Get-Process \| Where-Object { $_.Path -like '<this-root>\*' } \| Stop-Process` | defer |
+| `taskkill /IM node.exe`                        | **deny** |
+| `Stop-Process -Id 1234` · `taskkill /PID 1234` | defer    |
+| `Get-Content .\in.txt; Stop-Process -Id 1234`  | defer    |
+| `Get-Content .\in.txt; taskkill /PID 1234`     | defer    |
 | `Get-ChildItem C:\out` (not a guarded cmdlet)  | defer    |
 | `Get-Content "unterminated` (unparseable)      | defer    |
 
@@ -234,6 +283,10 @@ ordered. `Set-Location` and `Push-Location` are followed so a later relative
 operand resolves against the right directory; anything the hook can't follow
 (a bare `cd`, a `$var` target, `Pop-Location`) drops tracking and prompts on
 relative operands rather than guessing.
+
+`Stop-Process` and `taskkill` are guarded as process kills rather than as file
+operations — see [Unanchored process-kill deny](#unanchored-process-kill-deny)
+for the rule and the rewrites each deny recommends.
 
 A cmdlet that isn't in the table is **not checked**, and neither is a .NET call
 or a native `.exe`. See [Limitations](#limitations) for why that's the posture
@@ -296,6 +349,205 @@ a worktree, and a path in an *unrelated* git repo is never treated as a sibling
 (it shares no git common-dir with your repo). For deliberate cross-checkout work,
 `WORKSPACE_GUARD_OVERRIDE=<reason>` downgrades the deny to `ask`; see
 [Configuration](#configuration).
+
+### Unanchored process-kill deny
+
+Every check above is about *paths*. `pkill -f` addresses a process by **pattern**
+instead, which is a write to another session's work through the one door the
+workspace boundary can't see:
+
+```
+pkill -f "make check"      # every checkout on this host running make check
+pkill -f ginkgo            # every checkout on this host running ginkgo
+```
+
+Run several worktrees of one repo in parallel and a bare-program pattern reaches
+all of them. Measured across one developer's session transcripts: 38 `pkill`
+targets, 2 of which carried anything identifying the worktree that started them.
+One of the other 36 did the damage — a load harness cleaned up with
+`pkill -f 'make scripts-test'` killed the verification run in its own worktree
+and recorded a passing suite as a failure.
+
+So `pkill` and `killall` are **denied** unless some operand **anchors** the
+pattern to this workspace — the project root's directory name appearing as a
+whole path component, with a path separator on at least one side:
+
+```
+pkill -f "issue-125-a1b2/.build/ginkgo"   # anchored -> defer
+pkill -f "/home/k/ws/repo/bin/server"     # anchored -> defer
+pkill -f ginkgo                           # -> deny
+pkill -f issue-125-a1b2                   # -> deny (bare word, no separator)
+killall node                              # -> deny (a process name can't anchor)
+pkill -u karl                             # -> deny (no pattern at all)
+```
+
+A bare word doesn't count however distinctive it looks: the pattern is a
+substring match against a command line, not a path, and the hook can't judge
+whether a given word excludes a sibling. Component bounds treat `-`, `.` and `_`
+as name characters, so a root named `repo` does not anchor inside
+`repo-branch1`. A token still carrying an unresolved expansion never anchors
+either — bash decides at runtime where `$HOME/repo/bin` lands, so the `/repo/` in
+it proves nothing.
+
+**Deny rather than ask**, because 36 of those 38 kills would have raised a
+prompt: an `ask` on nearly every kill trains reflexive approval, which is the
+failure it exists to prevent. The two rewrites the message names cost nothing in
+the normal case — run `pgrep -fl <pattern>` and kill the pid(s) you meant, or put
+the workspace path in the pattern. For a deliberate cross-workspace kill,
+`WORKSPACE_GUARD_OVERRIDE=<reason>` downgrades it to `ask`.
+
+An **anchored** kill *defers* rather than emitting `allow`: it's out of this
+hook's scope, and an `allow` would short-circuit your own permission settings on
+a destructive command. `kill <pid>` is untouched — killing by pid is the rewrite
+the deny recommends, not a hazard.
+
+#### Kills fed by a pattern, not by a name
+
+The same blind kill dodges a rule that keys on the *command* by deriving pids
+from a pattern instead:
+
+```
+kill $(pgrep -f ginkgo)
+pgrep -f ginkgo | xargs -r kill
+ps -eo pid,command | grep ginkgo | grep -v grep | awk '{print $1}' | xargs -r kill
+for p in $(pgrep -f ginkgo); do kill $p; done
+```
+
+Every one of these kills exactly what `pkill -f ginkgo` kills. The third was the
+worst case: `grep` and `awk` are clean guarded commands, so the hook used to emit
+its blanket `allow` for the whole string *including the kill* — actively
+green-lighting it rather than merely missing it.
+
+Two rules close that. First, **a clean guarded command never speaks for a kill**:
+if anything in the command string signals a process, the hook emits nothing
+instead of `allow`, so your own permission settings still get their say. Second,
+the **source that produced the pids is checked as if its pattern were the kill's
+own** — and a launderable kill whose sources all fail the anchor test is denied
+with the same message and the same override.
+
+What counts as *launderable* is the narrow part: a `kill` whose operands are all
+literal pids or job specs was demonstrably not fed by a pattern, so it stays out
+of the rule even when it shares a command string with a `pgrep`.
+
+```
+pgrep -f ginkgo | xargs -r kill              # -> deny
+pgrep -f "<this-root>/bin/x" | xargs kill    # anchored -> defer
+pgrep -f ginkgo; kill 1234                   # literal pid -> defer
+kill $pid                                    # no pattern in the string -> defer
+```
+
+The pid sources are `pgrep`'s pattern operands and **`ps` itself** — not the
+command filtering it. A `ps` feeding a kill is a pid source whose selection the
+hook can't read, so it denies whatever the filter is, and denies with no filter
+at all:
+
+```
+ps -eo pid,command | awk '/ginkgo/ {print $1}' | xargs kill   # -> deny
+ps -eo pid,command | sed -n '/ginkgo/s/.*//p' | xargs kill    # -> deny
+ps -eo pid= | xargs kill                                      # -> deny
+kill $(ps -eo pid= | head -1)                                 # -> deny
+```
+
+A **`grep` in the same pipeline is readable**, so its pattern can still anchor
+one: `ps aux | grep "<this-root>/bin/x" | awk '{print $1}' | xargs kill` defers.
+That is the rewrite to reach for. An awk program is not read even when it looks
+anchored — reading one would be unsafe rather than merely imprecise, because an
+inverting program (`awk '!/<this-root>/ {print $1}'`) would scan as anchored
+while killing every *other* checkout.
+
+The pids have to be able to reach the kill: a `ps` counts in the kill's own
+pipeline, or inside a command substitution the kill consumes. So the everyday
+debugging idiom is untouched, because its `ps` consumes a pid rather than
+producing one:
+
+```
+./run.sh & pid=$!; kill $pid; ps -p $pid    # -> defer
+```
+
+An **exclusion** can't anchor a pipeline: `grep -v` removes the pids it matches
+rather than selecting them, so `ps … | grep ginkgo | grep -v "<this-root>/skip"`
+still denies — what reaches the kill is every *other* checkout's `ginkgo`. A
+pattern the hook can't read (`grep -f patterns.txt`) can't clear a pipeline
+either; it reports as unreadable rather than as absent.
+
+Provenance here is co-occurrence within one pipeline or command string, not
+dataflow: the hook doesn't prove the pids the kill receives came from the source
+it found. The literal-pid rule removes the case where that would matter, and
+`WORKSPACE_GUARD_OVERRIDE=<reason>` covers the remainder.
+
+#### `sh -c` bodies are opaque, so nothing speaks for them
+
+A shell `-c` operand is a whole command string inside one token, and the hook
+doesn't parse it. It won't *vouch* for it either: any command carrying a shell
+`-c` suppresses the blanket `allow`, so the string defers and your own permission
+settings decide.
+
+```
+cat in.txt; sh -c 'pkill -f ginkgo'     # -> defer (was: allow)
+cat in.txt | xargs -I{} sh -c 'kill {}' # -> defer (was: allow)
+cat in.txt; bash --version              # allow (no -c body)
+```
+
+This covers `sh`, `bash`, `zsh`, `dash` and `ksh` wherever they appear in the
+command — `timeout 5 bash -c …`, `xargs -I{} sh -c …`, `find … -exec sh -c … \;`.
+The body itself is still unchecked; see [Limitations](#limitations).
+
+#### PowerShell: `Stop-Process`
+
+The same rule, adapted to a cmdlet with three ways to name its target:
+
+```
+Stop-Process -Name node                     # -> deny (this is `killall`)
+Get-Process node | Stop-Process             # -> deny (nothing scopes the pipeline)
+Stop-Process -Id $p.Id                      # -> deny (the hook can't see the pid)
+Stop-Process -Id 1234                       # defer  (by pid, the safe rewrite)
+Get-Process | Where-Object { $_.Path -like '<this-root>\*' } | Stop-Process   # defer
+```
+
+`-Id` with literal pids is the `kill <pid>` case and is untouched. `-Name` is
+denied outright and *cannot* be rescued by an anchor: a process name carries no
+path, so nothing written around it scopes it to this workspace. Everything else —
+`-InputObject`, or processes arriving over the pipeline — is anchored by the rest
+of the **statement**, which is why the `Where-Object` filter two segments
+upstream counts. A statement ends at `;`, a newline, `&&`, `||` or `&`; `|`,
+parentheses and script-block braces all stay inside it.
+
+Covering the pipeline form is what keeps the rule honest. Guard only `-Name` and
+the deny teaches the agent to reach for `Get-Process node | Stop-Process`
+instead — the same host-wide kill, one keystroke further away.
+
+A clean cmdlet in the same string doesn't speak for the kill either. A
+`Stop-Process` or a `taskkill` anywhere in the string — including one inside a
+`$(…)` body — suppresses the blanket `allow` a `Get-Content` would otherwise
+earn, so `Get-Content .\in.txt; Stop-Process -Id 1234` emits nothing and your own
+permission settings decide. That covers the kills this rule leaves alone, by
+literal pid or anchored: they were never the hook's to green-light.
+
+#### Windows: `taskkill`
+
+`taskkill` is the same kill again, and it reaches both shells — Git Bash spawns
+it as a native executable, PowerShell as a native command — so it is checked in
+both:
+
+```
+taskkill /IM node.exe                       # -> deny (this is `killall`)
+taskkill /FI "IMAGENAME eq node.exe"        # -> deny (a filter names no path)
+taskkill                                    # -> deny (nothing selects)
+taskkill /PID $p                            # -> deny (the hook can't see the pid)
+taskkill /PID 1234                          # defer  (by pid, the safe rewrite)
+taskkill /?                                 # defer  (kills nothing)
+```
+
+Flags bind whichever prefix you write — `/IM`, `-IM`, or the `//IM` that Git
+Bash's path mangling requires — and their names are case-insensitive, as is the
+command word (`TASKKILL.EXE` is `taskkill`). The rewrite the deny names is this
+command's own: `tasklist /FI "IMAGENAME eq <name>"` to find the process, then
+`taskkill /PID <pid>` to kill just that one.
+
+Unlike `Stop-Process`, a `taskkill` is judged on **its own arguments**, not on
+the whole statement. It reads no pipeline — its selection is entirely in its own
+flags — so an anchor written upstream of it isn't what picks the processes, and
+counting one would clear a kill it has nothing to do with.
 
 ## Install
 
@@ -423,7 +675,7 @@ After upgrading either way:
 These steps describe the `Bash` frontend. The `PowerShell` tool has its own
 tokenizer, cmdlet table, and path resolution — backslash is a path character
 there, not an escape (see [The PowerShell tool](#the-powershell-tool)) — and
-rejoins this one at the classification steps (9–12), so both reach a decision
+rejoins this one at the classification steps (9–13), so both reach a decision
 through the same boundary rules and produce the same reasons. Symlink staging
 (step 7) has no PowerShell equivalent yet.
 
@@ -578,11 +830,13 @@ through the same boundary rules and produce the same reasons. Symlink staging
    read-only commands, sibling sessions of the same project. Claude Code writes
    each background task's output to
    `/tmp/claude-<uid>/<encoded-project>/<session-uuid>/tasks/<id>.output`, and
-   the agent reads it back with `cat`/`tail`/`grep`. Reading command output
-   isn't the boundary this hook guards, so:
+   the agent reads it back with `cat`/`tail`/`grep`. The same `<session-uuid>`
+   dir holds the `scratchpad/` Claude Code hands the session for temp files.
+   Neither is the boundary this hook guards, so:
    - a path under `/tmp/claude-<uid>/` that carries the **current** session's id
-     as a path segment is allowed for any guarded command (your own scratch);
-     and
+     as a path segment is allowed for any guarded command, **read or write** —
+     this check runs before the read/write split, so the session's whole scratch
+     tree is writable, not just readable; and
    - for **read-only** commands, a path under the current project's scratch dir
      (`/tmp/claude-<uid>/<encoded-project>/`) is allowed even when it belongs to
      a *different* session — the dispatcher-tails-workers pattern of parallel
@@ -623,7 +877,9 @@ through the same boundary rules and produce the same reasons. Symlink staging
    `/var/folders/…` are caught; on Windows a command's own `/tmp/x` resolves to
    `%TMP%` too, so it lands on the same root) is
    reclassified from `ask` to `deny`, with a message steering to a repo-local
-   gitignored scratch dir. Because this runs on the already-resolved file
+   gitignored scratch dir — and, when the session's `scratchpad/` from step 9 is
+   on disk, naming that too as the place for a throwaway that shouldn't outlive
+   the session. Because this runs on the already-resolved file
    arguments, a `/tmp` that appears only as text (a grep pattern, an `echo`
    string) is never matched. The Claude-managed temp root from step 9 is
    excluded — another session's task output keeps its `ask` (or, for a
@@ -642,14 +898,53 @@ through the same boundary rules and produce the same reasons. Symlink staging
    outside `ask`. The same rule is the sole active check on the `Edit`, `Write`,
    `MultiEdit`, and `NotebookEdit` tools. `WORKSPACE_GUARD_OVERRIDE=<reason>`
    downgrades it to `ask`; see [Configuration](#configuration).
-13. **Recurse into command substitutions.** A guarded command hidden in a
+13. **Deny** a process kill with no workspace anchor. `pkill` and `killall`
+   address a process by pattern rather than by path, so they reach every checkout
+   on the host. Value-taking flags come off (`-u karl`, `--signal TERM`), `--`
+   ends options, and a signal flag (`-9`, `-TERM`) is skipped like any other
+   flag; what remains are the pattern operands. Unless one of them contains the
+   project root's directory name as a whole path component *with a path
+   separator on at least one side*, the command is `deny`ed with the two safe
+   rewrites. Both misparse directions land on `deny`, so a flag table that
+   lags an implementation's options costs friction, never a hole. An anchored
+   kill emits nothing — it **defers** rather than `allow`ing, leaving your own
+   permission settings in charge of a destructive command.
+   `WORKSPACE_GUARD_OVERRIDE=<reason>` downgrades the deny to `ask`. PowerShell's
+   `Stop-Process` runs the same check with its own selection rules — the anchor is
+   looked for across the whole statement there, since the anchored form is a
+   `Where-Object` filter upstream in the pipeline. Windows' `taskkill` runs it in
+   *both* frontends, on its own arguments only: it reads no pipeline, so nothing
+   upstream selects what it kills. A literal `/PID` defers, `/IM` and `/FI` deny,
+   and `/?` kills nothing so it defers too. See
+   [Unanchored process-kill deny](#unanchored-process-kill-deny).
+   The same step covers a kill fed by a pattern rather than named by one, in the
+   Bash tool. Any signalling command in the string (`kill`, `pkill`, `killall`,
+   `taskkill`, directly or as an `xargs` command word) suppresses the blanket
+   `allow` a clean guarded command would otherwise earn, so a `grep` can never
+   carry an `xargs kill` past your permission settings — `allow` speaks for the
+   whole string. A shell `-c` body suppresses it the same way and for the same
+   reason: the body is one opaque token, so the hook has no basis to vouch for
+   it. A `Stop-Process` or a `taskkill` suppresses the PowerShell `allow` too,
+   including one this step had no cause to deny and one written inside a `$(…)`
+   body. The pid *sources* then go through the anchor test above: `pgrep`'s
+   pattern operands, and **`ps`** — which is the source in a pipeline, rather
+   than whatever filters it. A `ps` contributes an unreadable pattern that can
+   never anchor, so the pipeline is caught whatever the filter is (`awk`, `sed`,
+   `cut`) and with no filter at all; a `grep` in the same pipeline is readable,
+   so its pattern can still anchor. A `kill` whose operands aren't all literal
+   pids, with no anchoring pattern, is `deny`ed as one. `ps` counts only where
+   its pids can reach the kill — the same pipeline, or a substitution the kill
+   consumes — so `run & p=$!; kill $p; ps -p $p` is untouched. An inverting
+   `grep -v` and a pattern read from a `-f` file contribute nothing that can
+   anchor.
+14. **Recurse into command substitutions.** A guarded command hidden in a
    `"$(…)"` or backtick `` `…` `` substitution — `echo "$(mktemp -p /tmp x)"`,
    `` x=`grep secret /etc/passwd` `` — isn't tokenized as its own command by the
    step-1 lexer (the metacharacters are inside quotes), so its file ops would be
    invisible. The hook scans the *raw* command for substitution bodies in
    unquoted or double-quoted context (single-quoted `'$(…)'` is a bash literal
    and is skipped; `$((…))` arithmetic has no command) and runs each body back
-   through steps 1–13. Heredoc bodies leave the command line first and are
+   through steps 1–14. Heredoc bodies leave the command line first and are
    scanned on their own: a quoted-delimiter body is literal to bash and is
    dropped, an unquoted one is scanned with quoting turned off, because bash
    applies none inside it — so the apostrophe in a `don't` there is text, not
@@ -717,14 +1012,16 @@ flowing, avoid triggering it:
   (`/tmp`, `/var/tmp`, `$TMPDIR`, and `%TMP%` on Windows) is **denied** by
   default — not just prompted —
   because it's shared across sessions and worktrees and lives outside the root.
-  Use a repo-local gitignored scratch dir like `./tmp/out.txt` instead. (Redirects
+  Use a repo-local gitignored scratch dir like `./tmp/out.txt` instead — or, for
+  a throwaway that shouldn't outlive the session, this session's *own*
+  Claude-managed tree under `/tmp/claude-<uid>/…/<session>/…`, including the
+  `scratchpad/` dir Claude Code points you at. That tree is exempt for **reads
+  and writes both** — Claude Code chose the path and cleans it up. (Redirects
   and command output to `/dev/null`, `/dev/stdout`, `/dev/stderr`, and `/dev/fd/N`
-  are exempt and never prompt. Reading back this session's *own* background-task
-  output under `/tmp/claude-<uid>/…/<session>/…` is also exempt — that path is
-  managed by Claude Code, not something you choose — as is *read-only* access to
-  a sibling session's output under the same project's scratch dir.) Reading
-  files under `~/.claude/projects/` (Claude Code's own session and sub-agent
-  data) is also exempt for read-only commands.
+  are exempt and never prompt. Only *read-only* access extends to a sibling
+  session's output under the same project's scratch dir; writing there still
+  asks.) Reading files under `~/.claude/projects/` (Claude Code's own session
+  and sub-agent data) is also exempt for read-only commands.
 - **Read dependency source from in-workspace vendored/pinned copies, not the
   global cache.** Out-of-tree caches (Go's `~/go/pkg/mod`, npm's `~/.npm`, pip's
   `~/.cache/pip`, cargo's `~/.cargo/registry`) are outside the project root, so
@@ -739,6 +1036,41 @@ flowing, avoid triggering it:
   on the wrong branch. Use the same relative path under your session root. For
   deliberate cross-checkout work, set `WORKSPACE_GUARD_OVERRIDE=<reason>` to
   downgrade the deny to a prompt.
+- **Never kill a process by an unanchored pattern.** `pkill`/`killall` match
+  every checkout on the host, so `pkill -f "make check"` or `pkill -f ginkgo`
+  kills whatever another session is running — both are **denied**. Run
+  `pgrep -fl <pattern>` first and kill the pid(s) you meant, or put the project
+  root's directory name in the pattern as a path component with a separator
+  (`pkill -f "<root-dirname>/.build/ginkgo"`), which is allowed through. A bare
+  word doesn't count as an anchor, nor does a pattern with an unexpanded `$VAR`
+  in it. In PowerShell the same rule applies to
+  `Stop-Process`: `-Name` and an unfiltered `Get-Process … | Stop-Process` are
+  denied, `Stop-Process -Id <literal pid>` is never blocked, and the anchored
+  form is `Get-Process | Where-Object { $_.Path -like '<root>\*' } |
+  Stop-Process`. On Windows, `taskkill /IM <name>` and `taskkill /FI <filter>`
+  are denied from either shell; find the process with
+  `tasklist /FI "IMAGENAME eq <name>"` and kill it with `taskkill /PID <pid>`,
+  which is never blocked. For a deliberate cross-workspace kill, set
+  `WORKSPACE_GUARD_OVERRIDE=<reason>`.
+- **Routing the same pattern through pids doesn't help.**
+  `pgrep -f ginkgo | xargs kill`, `kill $(pgrep -f ginkgo)`, and
+  `ps … | grep ginkgo | awk '{print $1}' | xargs kill` are denied on the same
+  pattern rule — the anchor is what's missing, not the spelling. Nor does
+  changing the filter: `ps` is the pid source, so `ps … | awk '/ginkgo/ {print
+  $1}' | xargs kill`, the `sed`/`cut` spellings, and `ps -eo pid= | xargs kill`
+  with no filter at all are denied too. To scope a `ps` pipeline, put the
+  project root's directory name in a **`grep`** stage — that one the hook reads.
+  Note that a `grep -v` exclusion never anchors a pipeline, because what reaches
+  the kill is everything it did *not* match. `kill <literal pid>`,
+  `kill -0 <pid>`, and killing your own backgrounded child
+  (`cmd & pid=$!; kill $pid`, even alongside a `ps -p $pid`) are never blocked —
+  those are the rewrites, and they stay out of the rule even in a string that
+  also runs a `pgrep`.
+- **Don't wrap work in `sh -c '…'` to get it past the hook.** It won't be
+  analyzed, but it won't be approved either: a shell `-c` body makes the whole
+  command string defer instead of earning the silent `allow` a clean guarded
+  command gets, so you trade an allow for a prompt and gain nothing. Write the
+  command directly.
 ```
 
 The plugin also ships a **`reduce-workspace-guard-prompts`** skill: ask Claude
@@ -768,7 +1100,9 @@ of `scripts/bash-workspace-guard.py`. Add a row to guard another command.
 ### Host-wide temp (`/tmp`) deny
 
 A guarded file argument that resolves at or under a host-temp root is **denied**
-by default and steered to a repo-local gitignored scratch dir. Four environment
+by default and steered to the two destinations that are allowed: a repo-local
+gitignored scratch dir, and this session's own `scratchpad/` (named only when it
+exists on disk). Four environment
 variables tune this — all read at hook time, so no restart is needed:
 
 | Env var | Default | Effect |
@@ -812,22 +1146,25 @@ means `C:\Users\me\shared` — as it does in a command — rather than a `c` fol
 on whichever drive is current. Both rules apply to every configured path: the
 host-temp roots and allowlist above, and these prefixes.
 
-### Sibling-checkout (worktree) deny
+### Cross-workspace denies
 
-When the session runs in a git worktree, writes into a sibling checkout of the
-same repo are **denied** (see
-[Worktree-aware sibling-checkout deny](#worktree-aware-sibling-checkout-deny)).
-One env var tunes this, read at hook time (no restart needed):
+Two denies fire on work that reaches past this session's own checkout: a write
+into a sibling checkout of the same repo (see
+[Worktree-aware sibling-checkout deny](#worktree-aware-sibling-checkout-deny)),
+and a process kill with no workspace anchor (see
+[Unanchored process-kill deny](#unanchored-process-kill-deny)). One env var tunes
+both, read at hook time (no restart needed):
 
 | Env var | Default | Effect |
 | --- | --- | --- |
-| `WORKSPACE_GUARD_OVERRIDE` | (empty) | When set to a non-empty reason string, downgrades the sibling-checkout deny to `ask` for deliberate cross-checkout work. The reason is echoed back in the prompt. |
+| `WORKSPACE_GUARD_OVERRIDE` | (empty) | When set to a non-empty reason string, downgrades the sibling-checkout deny and the unanchored-kill deny to `ask`, for work that deliberately reaches another checkout. The reason is echoed back in the prompt. |
 
 `WORKSPACE_GUARD_OVERRIDE` is the one knob that *loosens* this guard, so it's
-empty by default and opt-in. The deny is the secure default: it self-heals in one
-agent round trip, whereas an approvable prompt invites the reflexive "yes" that
-lands the change on the wrong branch. Scope the override to the moment you
-actually need it (e.g. one command), not the whole session.
+empty by default and opt-in. The denies are the secure default: they self-heal in
+one agent round trip, whereas an approvable prompt invites the reflexive "yes"
+that lands the change on the wrong branch, or kills the wrong process. Scope the
+override to the moment you actually need it (e.g. one command), not the whole
+session.
 
 ### Outside-workspace ask vs. deny
 
@@ -943,9 +1280,10 @@ final output.
   redirect (`cat 2 >out`, where `2` is a file) is indistinguishable from the fd
   form and won't be checked. Such a path resolves in-root (and is allowed)
   anyway except after a `cd` outside the root — a pathological combination.
-- The current session's own Claude-managed task-output dir
-  (`/tmp/claude-<uid>/…/<session>/…`) is allowed silently, scoped to the
-  session via the hook's `session_id`. Read-only commands are additionally
+- The current session's own Claude-managed scratch tree
+  (`/tmp/claude-<uid>/…/<session>/…` — task output *and* `scratchpad/`) is
+  allowed silently for reads and writes alike, scoped to the session via the
+  hook's `session_id`. Read-only commands are additionally
   allowed on a *sibling* session's output under the same project's scratch dir
   (`/tmp/claude-<uid>/<encoded-project>/`), located by scanning the temp root
   for the slug directory that holds the current `session_id` — the
@@ -998,6 +1336,45 @@ final output.
   (fail-safe: the deny is never applied on uncertainty, so the boundary is never
   weakened). A main-checkout session is a deliberate no-op even when worktrees
   exist.
+- The unanchored-kill deny covers `pkill`, `killall`, and a pattern-fed `kill`
+  in the Bash tool, `Stop-Process` in the PowerShell tool, and `taskkill` in
+  both. A kill routed through something the hook doesn't parse — a script that
+  kills on your behalf — is checked in **neither**. `Get-Process -Id 1234 |
+  Stop-Process` denies even though the pid is literal — it's bound on the
+  upstream cmdlet, which the kill rule doesn't read; write `Stop-Process -Id 1234`.
+  `taskkill /FI "PID eq 1234"` denies for the same shape of reason: filter
+  expressions aren't parsed, so write `taskkill /PID 1234`.
+  Anchoring is also *lexical*, which cuts both ways: a process
+  started with a relative command line (`make check`) carries no path for `-f` to
+  match, so it can't be anchored at all and the answer there is `pgrep -fl` plus
+  a kill by pid; and a pattern naming an unrelated directory that happens to
+  share this root's basename reads as anchored. What the rule does reliably
+  exclude is a *sibling* checkout, whose directory name differs by construction.
+  A pattern naming a worktree nested under the project root (`.claude/worktrees/*`)
+  counts as in-workspace, consistent with the boundary the rest of the hook
+  draws.
+- A pattern-fed kill's pid sources are `pgrep` and `ps`, matched by command
+  word — a wrapper (`busybox ps`, a shell function, a script that kills on your
+  behalf) is not one. Because the source is `ps` and not the stage reading it,
+  the filter can be anything; the cost is that an *anchored* filter the hook
+  can't read doesn't clear the pipeline either, so
+  `ps … | awk '/<this-root>\/x/ {print $1}' | xargs kill` denies. Anchor with a
+  `grep`, or use `WORKSPACE_GUARD_OVERRIDE`. (Reading an `awk` program was
+  rejected as unsafe, not merely imprecise: an inverting `!/<this-root>/` program
+  would scan as anchored while killing every other checkout.) Provenance is
+  co-occurrence within one pipeline or command string rather than dataflow, so a
+  string that both searches by pattern and kills an unrelated non-literal pid is
+  denied though nothing was laundered; the override covers it.
+- **A shell `-c` body is never analyzed.** `sh -c '<body>'` — and the `bash`,
+  `zsh`, `dash`, `ksh` spellings, wherever they appear (`timeout 5 bash -c …`,
+  `xargs -I{} sh -c …`, `find … -exec sh -c … \;`) — puts a whole command string
+  in one token, so nothing inside is checked: not a kill, not an outside read,
+  not a redirect. What the hook does do is refuse to *vouch* for it: such a
+  command suppresses the blanket `allow`, so the string defers to your own
+  permission settings instead of being green-lit. Analyzing the body would also
+  mean judging paths in bodies that don't run on this host at all — a
+  `docker exec … sh -c 'cat /var/lib/…'` names a path inside the container — so
+  it stays unparsed for now.
 - **The PowerShell tool is guarded for a known set of cmdlets, and only those.**
   Claude Code ships two shell tools. Which one a Windows session gets depends on
   whether Git for Windows is installed — without it there is no Bash tool and
@@ -1008,7 +1385,8 @@ final output.
   `Select-String`, `Import-Csv`, `Import-Clixml`, `Set-Content`, `Add-Content`,
   `Out-File`, `Tee-Object`, `Export-Csv`, `Export-Clixml`, `Copy-Item`,
   `Move-Item`, `Remove-Item`, `Rename-Item`, their aliases (`cat`, `type`, `gc`,
-  `sls`, `sc`, `ac`, `cp`, `mv`, `rm`, `del`, …), and output redirects.
+  `sls`, `sc`, `ac`, `cp`, `mv`, `rm`, `del`, …), output redirects, and
+  `Stop-Process` and `taskkill` as process kills.
   Everything else — a cmdlet not on that list, a .NET call such as
   `[IO.File]::ReadAllText(…)`, a native `.exe` — is **not checked**, and the
   session gets no signal that it wasn't. The alternative was to prompt on

@@ -2669,6 +2669,25 @@ class HookEndToEndTests(unittest.TestCase):
         self._decision(f"cat in.txt > {sh(self._session_tmp(sess, 'log'))}",
                        "allow", session_id=sess)
 
+    def _session_scratchpad(self, session_id, name="note.txt"):
+        return os.path.join(
+            guard.claude_tmp_root(), "-Users-me-proj",
+            session_id, "scratchpad", name)
+
+    def test_claude_session_scratchpad_write_allow(self):
+        # The session's whole scratch tree — not just task output — is exempt
+        # for write commands too, which is what the README now promises. (#126)
+        sess = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+        self._decision(f"echo hi | tee {sh(self._session_scratchpad(sess))}",
+                       "allow", session_id=sess)
+
+    def test_claude_other_session_scratchpad_write_ask(self):
+        # The read-write exemption stops at the session boundary.
+        owner = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+        current = "ffffffff-0000-1111-2222-333333333333"
+        self._decision(f"cp in.txt {sh(self._session_scratchpad(owner))}",
+                       "ask", session_id=current)
+
     def test_claude_other_session_tmp_ask(self):
         # A path carrying a DIFFERENT session's uuid must still prompt — this is
         # the cross-session leak the per-session scope prevents.
@@ -4089,6 +4108,31 @@ class BuildReasonTests(unittest.TestCase):
         self.assertIn("prompting because", r)
         self.assertIn("deliberate", r)
 
+    def test_kill_category_names_pattern_and_both_rewrites(self):
+        r = guard.build_reason([(
+            "pkill", "kill",
+            {"cmd": "pkill", "pattern": "ginkgo", "root": "/repo/wt"},
+        )])
+        self.assertIn("Unanchored process kill", r)
+        self.assertIn("ginkgo", r)
+        self.assertIn("pgrep -fl", r)
+        self.assertIn("/repo/wt", r)
+        self.assertIn("WORKSPACE_GUARD_OVERRIDE", r)
+
+    def test_kill_without_a_pattern_says_so(self):
+        r = guard.build_reason([(
+            "pkill", "kill", {"cmd": "pkill", "pattern": None, "root": "/repo/wt"},
+        )])
+        self.assertIn("no pattern at all", r)
+
+    def test_kill_override_wording_downgrades(self):
+        r = guard.build_reason(
+            [("pkill", "kill",
+              {"cmd": "pkill", "pattern": "ginkgo", "root": "/repo/wt"})],
+            override="stuck harness")
+        self.assertIn("prompting because", r)
+        self.assertIn("stuck harness", r)
+
 
 class ReasonAdviceEndToEndTests(unittest.TestCase):
     """The emitted reason carries actionable advice end-to-end (subprocess)."""
@@ -4211,6 +4255,30 @@ class HostTempHelperTests(unittest.TestCase):
             os.mkdir(os.path.join(proj, "tmp"))
             present = guard.build_scratch_hint(proj, "tmp/")
             self.assertIn("Use the repo-local scratch dir `./tmp/`", present)
+
+    def test_build_scratch_hint_names_session_scratchpad(self):
+        # Q56: the second legitimate destination. Absent by default so the
+        # message never points at a directory the harness didn't create.
+        with tempfile.TemporaryDirectory() as proj:
+            self.assertNotIn("scratchpad",
+                             guard.build_scratch_hint(proj, "tmp/"))
+            pad = os.path.join(proj, "pad")
+            hint = guard.build_scratch_hint(proj, "tmp/", pad)
+            self.assertIn(pad, hint)
+            self.assertIn("allowed read-write", hint)
+            # Still steers to the repo-local dir first, knobs still last.
+            self.assertLess(hint.index("tmp"), hint.index(pad))
+            self.assertIn("WORKSPACE_GUARD_TMP_ALLOW", hint)
+
+    def test_session_scratchpad_requires_an_existing_dir(self):
+        with tempfile.TemporaryDirectory() as root:
+            sess = "aaaaaaaa-1111-2222-3333-444444444444"
+            self.assertIsNone(guard.session_scratchpad(sess, root))
+            self.assertIsNone(guard.session_scratchpad("", root))
+            self.assertIsNone(guard.session_scratchpad(sess, None))
+            pad = os.path.join(root, sess, "scratchpad")
+            os.makedirs(pad)
+            self.assertEqual(guard.session_scratchpad(sess, root), pad)
 
 
 class HostTempDenyTests(unittest.TestCase):
@@ -4371,6 +4439,29 @@ class HostTempDenyTests(unittest.TestCase):
         path = os.path.join(guard.claude_tmp_root(), "-Users-me-proj",
                             owner, "tasks", "abc.output")
         self._expect(f"cat {sh(path)}", "ask", session_id=current)
+
+    def test_deny_message_names_this_sessions_scratchpad(self):
+        # Q56: the deny steers to two destinations, not one — an agent told only
+        # about `./tmp/` infers the harness scratchpad is off-limits too.
+        sess = "5e551011-1111-2222-3333-444444444444"
+        proj_dir = os.path.join(guard.claude_tmp_root(),
+                                "-guardtest-q56-%d" % os.getpid())
+        pad = os.path.join(proj_dir, sess, "scratchpad")
+        try:
+            os.makedirs(pad, exist_ok=True)
+            out = self._expect("cat in.txt > /tmp/q56-hosttemp-log", "deny",
+                               session_id=sess)
+            reason = out["hookSpecificOutput"]["permissionDecisionReason"]
+            self.assertIn(pad, reason)
+            self.assertIn("./tmp/", reason)     # still names the repo-local dir
+        finally:
+            shutil.rmtree(proj_dir, ignore_errors=True)
+
+    def test_deny_message_omits_scratchpad_when_absent(self):
+        # No session_id -> nothing to name; the message is unchanged.
+        out = self._expect("cat in.txt > /tmp/q56-hosttemp-log", "deny")
+        self.assertNotIn(
+            "scratchpad", out["hookSpecificOutput"]["permissionDecisionReason"])
 
     def test_unguarded_command_to_tmp_still_defers(self):
         # The capability only upgrades paths the hook already extracts. An
@@ -4726,6 +4817,789 @@ class SiblingCheckoutTests(unittest.TestCase):
         # shell-expand) -> defer to builtin permissions.
         out = self._edit("Write", "$HOME/somewhere/x.txt")
         self.assertIsNone(out, f"expected defer, got {out!r}")
+
+
+class ClassifyPkillTests(unittest.TestCase):
+    """Operand extraction for `pkill`/`killall` (issue 125)."""
+
+    def test_non_kill_command_returns_none(self):
+        self.assertIsNone(guard.classify_pkill(["pgrep", "-f", "make"]))
+        self.assertIsNone(guard.classify_pkill(["kill", "1234"]))
+        self.assertIsNone(guard.classify_pkill([]))
+
+    def test_pattern_operand(self):
+        self.assertEqual(guard.classify_pkill(["pkill", "-f", "make check"]),
+                         ("pkill", ["make check"]))
+
+    def test_signal_flag_is_not_a_value_flag(self):
+        # `-9`/`-TERM` are signal selectors, not value-taking options: the
+        # pattern after them must survive as an operand.
+        self.assertEqual(guard.classify_pkill(["pkill", "-9", "-f", "ginkgo"]),
+                         ("pkill", ["ginkgo"]))
+        self.assertEqual(guard.classify_pkill(["pkill", "-TERM", "ginkgo"]),
+                         ("pkill", ["ginkgo"]))
+
+    def test_value_flags_consume_their_value(self):
+        self.assertEqual(guard.classify_pkill(["pkill", "-u", "karl", "node"]),
+                         ("pkill", ["node"]))
+        self.assertEqual(
+            guard.classify_pkill(["pkill", "--signal", "TERM", "-f", "node"]),
+            ("pkill", ["node"]))
+
+    def test_inline_value_flag_does_not_consume_next_token(self):
+        self.assertEqual(
+            guard.classify_pkill(["pkill", "--signal=TERM", "-f", "node"]),
+            ("pkill", ["node"]))
+
+    def test_selector_only_invocation_has_no_operands(self):
+        # Nothing ties `pkill -u karl` or `pkill -P 1234` to this workspace, so
+        # the caller must still deny — an empty list, not None.
+        self.assertEqual(guard.classify_pkill(["pkill", "-u", "karl"]),
+                         ("pkill", []))
+        self.assertEqual(guard.classify_pkill(["pkill", "-P", "1234"]),
+                         ("pkill", []))
+
+    def test_end_of_options(self):
+        self.assertEqual(guard.classify_pkill(["pkill", "-f", "--", "-weird"]),
+                         ("pkill", ["-weird"]))
+
+    def test_clustered_boolean_flags_fall_through(self):
+        self.assertEqual(guard.classify_pkill(["pkill", "-fx", "ginkgo"]),
+                         ("pkill", ["ginkgo"]))
+
+    def test_killall_and_absolute_command_path(self):
+        self.assertEqual(guard.classify_pkill(["killall", "-u", "karl", "node"]),
+                         ("killall", ["node"]))
+        self.assertEqual(guard.classify_pkill(["/usr/bin/pkill", "-f", "x"]),
+                         ("pkill", ["x"]))
+
+
+class ClassifyTaskkillTests(unittest.TestCase):
+    """Selection classification for Windows' `taskkill` (Q58)."""
+
+    def classify(self, text):
+        return guard.classify_taskkill(shlex.split(text))
+
+    def test_non_kill_command_returns_none(self):
+        self.assertIsNone(self.classify("tasklist /IM node.exe"))
+        self.assertIsNone(self.classify("kill 1234"))
+        self.assertIsNone(guard.classify_taskkill([]))
+
+    def test_command_word_is_normalized_like_windows_resolves_it(self):
+        for head in ("taskkill", "TASKKILL", "taskkill.exe", "TaskKill.EXE",
+                     "/c/Windows/System32/taskkill.exe"):
+            self.assertEqual(self.classify("%s /IM node.exe" % head),
+                             ("other", [2]), head)
+
+    def test_every_flag_prefix_binds(self):
+        # `/IM` is the documented form, `-IM` is accepted too, and `//IM` is what
+        # Git Bash's MSYS path mangling requires.
+        for flag in ("/IM", "//IM", "-IM", "/im", "-Im"):
+            self.assertEqual(self.classify("taskkill %s node.exe" % flag),
+                             ("other", [2]), flag)
+
+    def test_image_name_and_filter_are_selection(self):
+        self.assertEqual(self.classify('taskkill /FI "IMAGENAME eq node.exe"'),
+                         ("other", [2]))
+        self.assertEqual(
+            self.classify('taskkill /IM node.exe /FI "STATUS eq RUNNING"'),
+            ("other", [2, 4]))
+
+    def test_literal_pid_needs_no_anchor(self):
+        for text in ("taskkill /PID 1234", "taskkill /F /T /PID 1234",
+                     "taskkill //PID 1234"):
+            self.assertEqual(self.classify(text), ("pid", []), text)
+
+    def test_expandable_pid_is_not_a_pid(self):
+        # The `Stop-Process -Id $p.Id` case: host-wide, and the hook cannot tell
+        # it from a pid the agent looked up.
+        self.assertEqual(self.classify("taskkill /PID $p"), ("other", [2]))
+
+    def test_mixed_pid_and_image_reads_as_selection(self):
+        self.assertEqual(self.classify("taskkill /PID 1234 /IM node.exe"),
+                         ("other", [4]))
+
+    def test_switches_are_not_selection(self):
+        self.assertEqual(self.classify("taskkill /F /T"), ("other", []))
+
+    def test_remote_flags_consume_their_value(self):
+        # Without `consume` handling, `box` lands in the operand stream and drags
+        # a by-pid kill into a deny.
+        self.assertEqual(
+            self.classify("taskkill /S box /U karl /P pw /PID 1234"),
+            ("pid", []))
+
+    def test_no_selector_at_all_is_denied_selection(self):
+        self.assertEqual(self.classify("taskkill"), ("other", []))
+
+    def test_help_invocation_kills_nothing(self):
+        self.assertIsNone(self.classify("taskkill /?"))
+
+    def test_bare_operand_is_selection_the_hook_cannot_vouch_for(self):
+        # `taskkill node.exe` is a syntax error to Windows — nothing here is
+        # positional — but reading it as selection keeps the deny direction.
+        self.assertEqual(self.classify("taskkill node.exe"), ("other", [1]))
+
+
+class WorkspaceAnchorTests(unittest.TestCase):
+    """The path fragment that pins a kill pattern to this workspace (issue 125)."""
+
+    def _anchored(self, proj, pattern):
+        return guard.workspace_anchor_re(proj).search(pattern) is not None
+
+    def test_component_with_separator_anchors(self):
+        for pattern in ("repo/bin/server", "/ws/repo/bin", "bin/repo",
+                        "x\\repo\\bin"):
+            self.assertTrue(self._anchored("/ws/repo", pattern), pattern)
+
+    def test_bare_word_does_not_anchor(self):
+        # A pattern is a substring match against a command line, not a path;
+        # without a separator there is nothing making it a path anchor.
+        self.assertFalse(self._anchored("/ws/repo", "repo"))
+
+    def test_partial_component_does_not_anchor(self):
+        # The whole point: a sibling worktree whose name merely contains the
+        # root's name must not read as this workspace.
+        for pattern in ("repo-branch1/bin", "x/repo-branch1/bin",
+                        "/ws/myrepo/bin", "repo.old/bin", "/ws/repo_2/bin"):
+            self.assertFalse(self._anchored("/ws/repo", pattern), pattern)
+
+    def test_trailing_separator_on_root_is_ignored(self):
+        self.assertTrue(self._anchored("/ws/repo/", "repo/bin"))
+
+    def test_filesystem_root_has_no_anchor(self):
+        self.assertIsNone(guard.workspace_anchor_re(os.sep))
+
+
+class KillOperandAnchorTests(unittest.TestCase):
+    """Expansion handling in the anchor check (issue 125)."""
+
+    def setUp(self):
+        self.anchor = guard.workspace_anchor_re("/ws/repo")
+
+    def _ok(self, tok, cwd="/ws/repo", unknown=False):
+        return guard.kill_operand_anchored(tok, self.anchor, cwd, unknown)
+
+    def test_literal_path_anchors(self):
+        self.assertTrue(self._ok("/ws/repo/bin/server"))
+
+    def test_unresolved_expansion_never_anchors(self):
+        # `$HOME/repo/bin` contains the literal text `/repo/`, but bash decides
+        # at runtime where it lands, so the text proves nothing.
+        self.assertFalse(self._ok("$HOME/repo/bin"))
+        self.assertFalse(self._ok("~someuser/repo/bin"))
+
+    def test_trailing_dollar_is_a_regex_anchor_not_an_expansion(self):
+        self.assertTrue(self._ok("repo/bin$"))
+
+    def test_pwd_substitution_prefix_resolves(self):
+        self.assertTrue(self._ok("$(pwd)/bin/server"))
+
+    def test_pwd_substitution_needs_a_tracked_cwd(self):
+        self.assertFalse(self._ok("$(pwd)/bin/server", unknown=True))
+
+    def test_no_anchor_available_denies_everything(self):
+        self.assertFalse(
+            guard.kill_operand_anchored("/ws/repo/bin", None, "/ws/repo", False))
+
+
+class UnanchoredKillEndToEndTests(unittest.TestCase):
+    """Decisions for `pkill`/`killall` end-to-end (issue 125).
+
+    The workspace is a directory with a distinctive name so an anchored pattern
+    is unambiguous, and `wt-b` stands in for a sibling worktree. No process is
+    ever signalled: the hook reads the command as a JSON string and the test
+    never invokes bash on it.
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.base = os.path.realpath(self._tmp.name)
+        self.workspace = os.path.join(self.base, "wt-a")
+        os.mkdir(self.workspace)
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def _out(self, cmd, **kw):
+        return run_hook(cmd, self.workspace, project_dir=self.workspace, **kw)
+
+    def _decision(self, cmd, expected, **kw):
+        out = self._out(cmd, **kw)
+        if expected == "defer":
+            self.assertIsNone(out, f"expected defer for {cmd!r}, got {out!r}")
+            return None
+        self.assertIsNotNone(out, f"expected a decision, got defer for: {cmd!r}")
+        got = out["hookSpecificOutput"]["permissionDecision"]
+        self.assertEqual(got, expected, f"expected {expected!r} for {cmd!r}")
+        return out["hookSpecificOutput"]["permissionDecisionReason"]
+
+    def test_bare_program_pattern_denies(self):
+        for cmd in ('pkill -f ginkgo', 'pkill -f "make check"',
+                    'pkill -9 -f "usr/bin/make check"', 'killall node'):
+            self._decision(cmd, "deny")
+
+    def test_sibling_worktree_name_denies(self):
+        # The motivating case: a pattern naming a *different* worktree.
+        self._decision('pkill -f "wt-b/.build/ginkgo"', "deny")
+
+    def test_anchored_pattern_defers(self):
+        # Defer, not allow: an anchored kill is out of this hook's scope, and an
+        # `allow` would short-circuit the user's own permission settings on a
+        # destructive command.
+        self._decision('pkill -f "wt-a/.build/ginkgo"', "defer")
+        self._decision('pkill -f %s' % sh(os.path.join(
+            self.workspace, "bin", "server")), "defer")
+
+    def test_selector_without_pattern_denies(self):
+        r = self._decision('pkill -u karl', "deny")
+        self.assertIn("no pattern at all", r)
+
+    def test_kill_by_pid_is_untouched(self):
+        # Killing by pid is the rewrite the deny message recommends.
+        self._decision('kill 1234', "defer")
+        self._decision('pgrep -fl ginkgo', "defer")
+
+    def test_reason_names_the_pattern_and_both_rewrites(self):
+        r = self._decision('pkill -f ginkgo', "deny")
+        self.assertIn("ginkgo", r)
+        self.assertIn("pgrep -fl", r)
+        self.assertIn(self.workspace, r)
+        self.assertIn("WORKSPACE_GUARD_OVERRIDE", r)
+
+    def test_override_downgrades_to_ask(self):
+        out = self._out('pkill -f ginkgo',
+                        env_extra={"WORKSPACE_GUARD_OVERRIDE": "stuck harness"})
+        self.assertEqual(out["hookSpecificOutput"]["permissionDecision"], "ask")
+        self.assertIn("stuck harness",
+                      out["hookSpecificOutput"]["permissionDecisionReason"])
+
+    def test_propagated_literal_variable_is_checked(self):
+        self._decision('P=ginkgo; pkill -f $P', "deny")
+
+    def test_kill_inside_command_substitution_is_caught(self):
+        self._decision('echo "$(pkill -f ginkgo)"', "deny")
+
+    def test_unanchored_kill_beats_a_clean_guarded_command(self):
+        # A clean `cat` would emit `allow` for the whole string; the kill's deny
+        # must win rather than being laundered into a blanket allow.
+        self._decision('cat ./in.txt && pkill -f ginkgo', "deny")
+
+    def test_bypass_mode_still_denies(self):
+        self._decision('pkill -f ginkgo', "deny",
+                       permission_mode="bypassPermissions")
+
+
+class TaskkillEndToEndTests(unittest.TestCase):
+    """Decisions for `taskkill` through the Bash frontend (Q58).
+
+    Git Bash is where a bash-tool session reaches Windows' own kill. No process
+    is ever signalled: the hook reads the command as a JSON string and the test
+    never invokes a shell on it.
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.base = os.path.realpath(self._tmp.name)
+        self.workspace = os.path.join(self.base, "wt-a")
+        os.mkdir(self.workspace)
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def _out(self, cmd, **kw):
+        return run_hook(cmd, self.workspace, project_dir=self.workspace, **kw)
+
+    def _decision(self, cmd, expected, **kw):
+        out = self._out(cmd, **kw)
+        if expected == "defer":
+            self.assertIsNone(out, f"expected defer for {cmd!r}, got {out!r}")
+            return None
+        self.assertIsNotNone(out, f"expected a decision, got defer for: {cmd!r}")
+        got = out["hookSpecificOutput"]["permissionDecision"]
+        self.assertEqual(got, expected, f"expected {expected!r} for {cmd!r}")
+        return out["hookSpecificOutput"]["permissionDecisionReason"]
+
+    def test_image_name_denies(self):
+        # `taskkill /IM node.exe` is `killall node` — every checkout's node.
+        for cmd in ("taskkill //IM node.exe", "taskkill /IM node.exe",
+                    "taskkill -IM node.exe", "taskkill /F /T //IM node.exe",
+                    "TASKKILL.EXE //IM node.exe"):
+            self._decision(cmd, "deny")
+
+    def test_filter_denies(self):
+        self._decision('taskkill //FI "IMAGENAME eq node.exe"', "deny")
+
+    def test_no_selector_denies(self):
+        r = self._decision("taskkill", "deny")
+        self.assertIn("no pattern at all", r)
+
+    def test_kill_by_literal_pid_is_untouched(self):
+        for cmd in ("taskkill //PID 1234", "taskkill /F //PID 1234",
+                    "taskkill //S box //U karl //PID 1234", "taskkill /?"):
+            self._decision(cmd, "defer")
+
+    def test_expandable_pid_denies(self):
+        self._decision("taskkill //PID $p", "deny")
+
+    def test_anchored_filter_defers(self):
+        # Defer, not allow: an anchored kill is out of this hook's scope, and an
+        # `allow` would short-circuit the user's own permission settings.
+        self._decision('taskkill //FI %s' % sh(
+            'WINDOWTITLE eq %s' % os.path.join(self.workspace, '*')), "defer")
+
+    def test_sibling_worktree_filter_denies(self):
+        self._decision('taskkill //FI %s' % sh(
+            'WINDOWTITLE eq %s' % os.path.join(self.base, 'wt-b', '*')), "deny")
+
+    def test_reason_names_the_taskkill_rewrites(self):
+        r = self._decision("taskkill //IM node.exe", "deny")
+        self.assertIn("node.exe", r)
+        self.assertIn("taskkill /PID", r)
+        self.assertIn("tasklist", r)
+        self.assertIn("WORKSPACE_GUARD_OVERRIDE", r)
+        self.assertNotIn("pgrep", r)          # the pkill rewrite, wrong command
+
+    def test_clean_read_never_launders_a_taskkill(self):
+        # `allow` speaks for the whole string, so a clean `cat` must not carry
+        # even the by-pid form past the user's own permission settings.
+        self._decision("cat ./in.txt && taskkill //IM node.exe", "deny")
+        self._decision("cat ./in.txt && taskkill //PID 1234", "defer")
+
+    def test_kill_inside_command_substitution_is_caught(self):
+        self._decision('echo "$(taskkill //IM node.exe)"', "deny")
+
+    def test_override_downgrades_to_ask(self):
+        out = self._out("taskkill //IM node.exe",
+                        env_extra={"WORKSPACE_GUARD_OVERRIDE": "stuck harness"})
+        self.assertEqual(out["hookSpecificOutput"]["permissionDecision"], "ask")
+        self.assertIn("stuck harness",
+                      out["hookSpecificOutput"]["permissionDecisionReason"])
+
+    def test_bypass_mode_still_denies(self):
+        self._decision("taskkill //IM node.exe", "deny",
+                       permission_mode="bypassPermissions")
+
+
+class SignalCommandTests(unittest.TestCase):
+    """Which groups signal a process, and which of those could be pattern-fed."""
+
+    def test_pattern_kill_commands_are_never_launderable(self):
+        # pkill/killall carry their own anchor rule; folding them in would let an
+        # unrelated unanchored pattern deny a correctly anchored one.
+        self.assertEqual(guard.signal_command(["pkill", "-f", "x"]),
+                         ("pkill", False))
+        self.assertEqual(guard.signal_command(["killall", "node"]),
+                         ("killall", False))
+
+    def test_literal_pid_operands_are_not_launderable(self):
+        for toks in (["kill", "1234"], ["kill", "-9", "1234", "5678"],
+                     ["kill", "-0", "4321"], ["kill", "%1"], ["kill", "%+"],
+                     ["kill", "-l"]):
+            self.assertEqual(guard.signal_command(toks), ("kill", False), toks)
+
+    def test_non_literal_operands_are_launderable(self):
+        for toks in (["kill", "$p"], ["kill", "$("], ["kill", "-9", "$pids"]):
+            self.assertEqual(guard.signal_command(toks), ("kill", True), toks)
+
+    def test_xargs_running_a_signal_is_launderable(self):
+        for toks in (["xargs", "-r", "kill"], ["xargs", "kill", "-9"],
+                     ["xargs", "-I{}", "kill", "{}"],
+                     ["xargs", "-r", "/bin/kill"]):
+            self.assertEqual(guard.signal_command(toks), ("kill", True), toks)
+
+    def test_non_signal_commands_return_none(self):
+        for toks in (["pgrep", "-f", "x"], ["xargs", "wc", "-l"],
+                     ["grep", "kill", "f.txt"], ["ps", "aux"], []):
+            self.assertIsNone(guard.signal_command(toks), toks)
+
+    def test_absolute_command_path(self):
+        self.assertEqual(guard.signal_command(["/bin/kill", "1234"]),
+                         ("kill", False))
+
+
+class ShellCGroupTests(unittest.TestCase):
+    """Which groups carry a shell `-c` body the hook cannot read (Q60)."""
+
+    def test_the_shell_spellings(self):
+        for toks in (["sh", "-c", "kill 1"], ["bash", "-c", "x"],
+                     ["zsh", "-c", "x"], ["dash", "-c", "x"],
+                     ["ksh", "-c", "x"], ["/bin/sh", "-c", "x"],
+                     ["bash", "-lc", "x"], ["bash", "-euc", "x"]):
+            self.assertTrue(guard.shell_c_group(toks), toks)
+
+    def test_the_shell_is_usually_not_the_command_word(self):
+        # The wrappers that actually appear in real command strings.
+        for toks in (["timeout", "5", "bash", "-c", "x"],
+                     ["xargs", "-I{}", "sh", "-c", "kill {}"],
+                     ["find", ".", "-exec", "sh", "-c", "cat {}", ";"],
+                     ["env", "FOO=1", "sh", "-c", "x"]):
+            self.assertTrue(guard.shell_c_group(toks), toks)
+
+    def test_a_long_option_is_not_the_c_flag(self):
+        # `--version` and `--config=…` both contain a `c`; neither is `-c`.
+        for toks in (["bash", "--version"], ["sh", "--help"],
+                     ["bash", "--config=x"], ["bash", "script.sh"],
+                     ["bash"]):
+            self.assertFalse(guard.shell_c_group(toks), toks)
+
+    def test_a_c_flag_on_a_non_shell_does_not_fire(self):
+        for toks in (["grep", "-c", "foo", "f.txt"], ["sort", "-c", "f.txt"],
+                     ["ps", "aux"], []):
+            self.assertFalse(guard.shell_c_group(toks), toks)
+
+
+class PidSourcePatternTests(unittest.TestCase):
+    """Pattern extraction from the commands that produce a pid list."""
+
+    def test_pgrep_reuses_the_pkill_flag_table(self):
+        self.assertEqual(guard.pgrep_operands(["pgrep", "-f", "make check"]),
+                         ["make check"])
+        self.assertEqual(guard.pgrep_operands(["pgrep", "-u", "karl", "node"]),
+                         ["node"])
+        self.assertEqual(guard.pgrep_operands(["pgrep", "-fl", "ginkgo"]),
+                         ["ginkgo"])
+
+    def test_pgrep_only(self):
+        self.assertIsNone(guard.pgrep_operands(["pkill", "-f", "x"]))
+        self.assertIsNone(guard.pgrep_operands([]))
+
+    def test_grep_positional_pattern(self):
+        self.assertEqual(guard.grep_pattern_operands(["grep", "ginkgo"]),
+                         ["ginkgo"])
+        self.assertEqual(
+            guard.grep_pattern_operands(["egrep", "-i", "ginkgo"]), ["ginkgo"])
+
+    def test_grep_e_values_are_collected(self):
+        self.assertEqual(
+            guard.grep_pattern_operands(["grep", "-e", "a", "-e", "b"]),
+            ["a", "b"])
+        self.assertEqual(guard.grep_pattern_operands(["grep", "--regexp=a"]),
+                         ["a"])
+
+    def test_a_file_operand_is_never_read_as_a_pattern(self):
+        # The unsafe direction: a file whose path carries the root's name would
+        # otherwise anchor a pipeline it has nothing to do with.
+        self.assertEqual(
+            guard.grep_pattern_operands(["grep", "-e", "x", "wt-a/list.txt"]),
+            ["x"])
+        self.assertEqual(
+            guard.grep_pattern_operands(
+                ["grep", "-f", "pats.txt", "wt-a/list.txt"]),
+            [guard.UNREADABLE_PATTERN])
+
+    def test_flag_values_are_not_patterns(self):
+        self.assertEqual(
+            guard.grep_pattern_operands(["grep", "-m", "1", "ginkgo"]),
+            ["ginkgo"])
+        self.assertEqual(
+            guard.grep_pattern_operands(["grep", "--include", "*.py", "gink"]),
+            ["gink"])
+
+    def test_inverting_grep_contributes_no_anchorable_pattern(self):
+        # `-v` excludes rather than selects, so its pattern is not what the kill
+        # receives; counting it would let an exclusion anchor the pipeline.
+        for toks in (["grep", "-v", "wt-a/skip"], ["grep", "-iv", "wt-a/skip"],
+                     ["grep", "--invert-match", "wt-a/skip"],
+                     ["grep", "--invert", "wt-a/skip"]):
+            self.assertEqual(guard.grep_pattern_operands(toks),
+                             [guard.UNREADABLE_PATTERN], toks)
+
+    def test_non_grep_commands_return_none(self):
+        for toks in (["awk", "{print $1}"], ["ps", "aux"], ["cat", "f"]):
+            self.assertIsNone(guard.grep_pattern_operands(toks), toks)
+
+
+class PatternFedKillEndToEndTests(unittest.TestCase):
+    """A kill that derives its pids from a pattern gets the pattern's verdict.
+
+    The five laundering shapes measured against the hook at 13bb4d1, plus the
+    safe forms that must stay untouched. No process is ever signalled: the hook
+    reads the command as a JSON string and the test never invokes bash on it.
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.base = os.path.realpath(self._tmp.name)
+        self.workspace = os.path.join(self.base, "wt-a")
+        os.mkdir(self.workspace)
+        with open(os.path.join(self.workspace, "in.txt"), "w") as f:
+            f.write("hello\n")
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def _out(self, cmd, **kw):
+        return run_hook(cmd, self.workspace, project_dir=self.workspace, **kw)
+
+    def _decision(self, cmd, expected, **kw):
+        out = self._out(cmd, **kw)
+        if expected == "defer":
+            self.assertIsNone(out, f"expected defer for {cmd!r}, got {out!r}")
+            return None
+        self.assertIsNotNone(out, f"expected a decision, got defer for: {cmd!r}")
+        got = out["hookSpecificOutput"]["permissionDecision"]
+        self.assertEqual(got, expected, f"expected {expected!r} for {cmd!r}")
+        return out["hookSpecificOutput"]["permissionDecisionReason"]
+
+    def test_the_five_measured_laundering_shapes_deny(self):
+        for cmd in (
+                'pkill -f ginkgo',
+                'kill $(pgrep -f ginkgo)',
+                'pgrep -f ginkgo | xargs -r kill',
+                "ps -eo pid,command | grep ginkgo | grep -v grep "
+                "| awk '{print $1}' | xargs -r kill",
+                'for p in $(pgrep -f ginkgo); do kill $p; done'):
+            self._decision(cmd, "deny")
+
+    def test_the_clean_guarded_pipeline_no_longer_allows(self):
+        # The worst case: `grep` and `awk` are clean guarded commands, so the
+        # whole string used to come back `allow` — the guard green-lit the
+        # laundered kill rather than merely missing it.
+        r = self._decision(
+            "ps -eo pid,command | grep ginkgo | grep -v grep "
+            "| awk '{print $1}' | xargs -r kill", "deny")
+        self.assertIn("ginkgo", r)
+        self.assertIn("pgrep -fl", r)
+
+    def test_a_clean_guarded_command_never_speaks_for_a_kill(self):
+        # Part 1 on its own: no pattern source, so no deny — but `allow` would
+        # short-circuit the user's permission settings for the kill too.
+        for cmd in ('cat ./in.txt && kill 1234',
+                    'grep foo ./in.txt; kill $pid',
+                    'cat ./in.txt && pkill -f "wt-a/.build/ginkgo"'):
+            self._decision(cmd, "defer")
+
+    def test_safe_kill_forms_stay_untouched(self):
+        for cmd in ('kill 1234', 'kill -9 1234 5678', 'kill -0 1234',
+                    'kill %1', 'kill $pid', 'sleep 5 & pid=$!; kill $pid'):
+            self._decision(cmd, "defer")
+
+    def test_a_literal_pid_kill_is_not_laundering(self):
+        # The proof the literal-pid rule buys: inspecting by pattern and then
+        # killing a pid you already know is the rewrite the deny recommends.
+        self._decision('pgrep -f ginkgo; kill 1234', "defer")
+        self._decision('ps aux | grep ginkgo; kill 1234', "defer")
+
+    def test_anchored_patterns_defer(self):
+        for cmd in ('kill $(pgrep -f "wt-a/bin/server")',
+                    'pgrep -f "wt-a/bin/server" | xargs -r kill',
+                    "ps -eo pid,command | grep 'wt-a/bin/server' "
+                    "| grep -v grep | awk '{print $1}' | xargs -r kill"):
+            self._decision(cmd, "defer")
+
+    def test_an_exclusion_cannot_anchor_the_pipeline(self):
+        # `grep -v wt-a/skip` names this workspace but *removes* those pids, so
+        # what the kill receives is every OTHER checkout's ginkgo.
+        self._decision("ps aux | grep ginkgo | grep -v 'wt-a/skip' "
+                       "| xargs kill", "deny")
+        self._decision("ps aux | grep -v foo | xargs kill", "deny")
+
+    def test_an_unreadable_pattern_cannot_clear_the_pipeline(self):
+        # `grep -f` takes its patterns from a file the hook can't read; that is
+        # the case it cannot clear, not evidence there is no pid source.
+        r = self._decision("ps aux | grep -f ./in.txt | awk '{print $1}' "
+                           "| xargs kill", "deny")
+        self.assertIn(guard.UNREADABLE_PATTERN, r)
+
+    def test_grep_not_fed_by_ps_is_not_a_pid_source(self):
+        self._decision('grep ginkgo ./in.txt; kill $pid', "defer")
+        self._decision('cat ./in.txt | grep ginkgo | xargs kill', "defer")
+
+    def test_a_ps_pipeline_with_no_kill_still_allows(self):
+        for cmd in ('ps -eo pid,command | grep ginkgo',
+                    "ps aux | grep ginkgo | awk '{print $1}'"):
+            self._decision(cmd, "allow")
+
+    def test_source_and_kill_on_opposite_sides_of_a_substitution(self):
+        # Quoting hides the body from the outer tokenizer, so neither half is an
+        # offender on its own — the facts have to cross the recursion.
+        self._decision('kill "$(pgrep -f ginkgo)"', "deny")
+
+    def test_reason_reuses_the_kill_category(self):
+        r = self._decision('pgrep -f ginkgo | xargs -r kill', "deny")
+        self.assertIn("Unanchored process kill", r)
+        self.assertIn("ginkgo", r)
+        self.assertIn(self.workspace, r)
+        self.assertIn("WORKSPACE_GUARD_OVERRIDE", r)
+
+    def test_override_downgrades_to_ask(self):
+        out = self._out('pgrep -f ginkgo | xargs -r kill',
+                        env_extra={"WORKSPACE_GUARD_OVERRIDE": "stuck harness"})
+        self.assertEqual(out["hookSpecificOutput"]["permissionDecision"], "ask")
+        self.assertIn("stuck harness",
+                      out["hookSpecificOutput"]["permissionDecisionReason"])
+
+    def test_bypass_mode_still_denies(self):
+        self._decision('pgrep -f ginkgo | xargs -r kill', "deny",
+                       permission_mode="bypassPermissions")
+
+
+class PsPidSourceEndToEndTests(unittest.TestCase):
+    """`ps` is the pid source, so the filter reading it need not be a grep (Q60).
+
+    No process is ever signalled: the hook reads the command as a JSON string
+    and the test never invokes bash on it.
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.base = os.path.realpath(self._tmp.name)
+        self.workspace = os.path.join(self.base, "wt-a")
+        os.mkdir(self.workspace)
+        with open(os.path.join(self.workspace, "in.txt"), "w") as f:
+            f.write("hello\n")
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def _out(self, cmd, **kw):
+        return run_hook(cmd, self.workspace, project_dir=self.workspace, **kw)
+
+    def _decision(self, cmd, expected, **kw):
+        out = self._out(cmd, **kw)
+        if expected == "defer":
+            self.assertIsNone(out, f"expected defer for {cmd!r}, got {out!r}")
+            return None
+        self.assertIsNotNone(out, f"expected a decision, got defer for: {cmd!r}")
+        got = out["hookSpecificOutput"]["permissionDecision"]
+        self.assertEqual(got, expected, f"expected {expected!r} for {cmd!r}")
+        return out["hookSpecificOutput"]["permissionDecisionReason"]
+
+    def test_a_filter_that_is_not_grep_no_longer_escapes(self):
+        # Each measured at d076eb4 as a defer. All kill the same processes as the
+        # already-denied `pkill -f ginkgo`.
+        for cmd in ("ps -eo pid,command | awk '/ginkgo/ {print $1}' "
+                    "| xargs -r kill",
+                    "ps aux | awk '/ginkgo/ {print $2}' | xargs kill -9",
+                    "ps -eo pid,command | sed -n '/ginkgo/s/^ *\\([0-9]*\\).*"
+                    "/\\1/p' | xargs kill",
+                    "ps -eo pid,command | cut -d' ' -f1 | xargs kill",
+                    "ps -eo pid,command | head -5 | awk '{print $1}' "
+                    "| xargs kill"):
+            self._decision(cmd, "deny")
+
+    def test_a_pipeline_with_no_filter_at_all_is_caught(self):
+        # The shape the grep-as-source framing could never see: nothing to read.
+        self._decision('ps -eo pid= | xargs kill', "deny")
+        self._decision('ps -eo pid= | xargs -r kill -9', "deny")
+
+    def test_an_anchored_grep_still_clears_the_pipeline(self):
+        # The ps stand-in never anchors, but the unchanged any-pattern-anchors
+        # rule means a readable grep pattern in the same pipeline still does.
+        for cmd in ("ps -eo pid,command | grep 'wt-a/bin/server' "
+                    "| awk '{print $1}' | xargs -r kill",
+                    "ps aux | grep wt-a/api | cut -d' ' -f1 | xargs kill"):
+            self._decision(cmd, "defer")
+
+    def test_an_anchored_awk_program_still_denies(self):
+        # The documented cost. The hook cannot read an awk program, and reading
+        # one would be unsafe rather than imprecise: an inverting program
+        # (`!/wt-a/`) would read as anchored while killing every other checkout.
+        self._decision("ps -eo pid,command | awk '/wt-a\\/ginkgo/ {print $1}' "
+                       "| xargs -r kill", "deny")
+
+    def test_the_background_child_idiom_is_untouched(self):
+        # `ps -p $pid` CONSUMES a pid the shell already knows; it is in its own
+        # group, so no pids flow to the kill. Two real corpus commands have this
+        # shape — without the same-pipeline rule the guard would deny them.
+        for cmd in ('./run.sh & pid=$!; sleep 2; kill -TERM $pid; '
+                    'ps -p $pid >/dev/null && echo alive',
+                    'make check & p=$!; kill $p; ps -p $p',
+                    'ps aux > ./procs.txt; kill $p',
+                    'ps aux; kill $p'):
+            self._decision(cmd, "defer")
+
+    def test_a_ps_pipeline_with_no_kill_is_unaffected(self):
+        # No launderable kill, so the ps contributes nothing and each pipeline
+        # keeps the verdict its own commands earn: `awk` is guarded, `cut` isn't.
+        self._decision("ps aux | awk '{print $1}'", "allow")
+        self._decision("ps -eo pid,command | cut -d' ' -f1", "defer")
+
+    def test_awk_outside_a_ps_pipeline_is_not_a_pid_source(self):
+        self._decision("awk '/ginkgo/ {print $1}' ./in.txt", "allow")
+        self._decision("cat ./in.txt | awk '{print $1}' | xargs kill", "defer")
+
+    def test_the_substitution_boundary(self):
+        # A body's output is consumed by the enclosing command by definition, so
+        # a `ps` anywhere in one reaches an outer launderable kill.
+        self._decision('kill $(ps -eo pid= | head -1)', "deny")
+        self._decision('kill "$(ps aux | awk \'/ginkgo/ {print $1}\')"', "deny")
+        self._decision("kill $(ps -eo pid,command | grep wt-a/api "
+                       "| awk '{print $1}')", "defer")
+
+    def test_a_literal_pid_kill_is_not_laundering(self):
+        self._decision("ps -eo pid,command | awk '{print $1}'; kill 1234",
+                       "defer")
+
+    def test_reason_names_the_unreadable_source(self):
+        r = self._decision("ps -eo pid= | xargs kill", "deny")
+        self.assertIn("Unanchored process kill", r)
+        self.assertIn(guard.UNREADABLE_PATTERN, r)
+        self.assertIn("WORKSPACE_GUARD_OVERRIDE", r)
+
+    def test_override_downgrades_to_ask(self):
+        out = self._out("ps -eo pid= | xargs kill",
+                        env_extra={"WORKSPACE_GUARD_OVERRIDE": "stuck harness"})
+        self.assertEqual(out["hookSpecificOutput"]["permissionDecision"], "ask")
+
+    def test_bypass_mode_still_denies(self):
+        self._decision("ps -eo pid= | xargs kill", "deny",
+                       permission_mode="bypassPermissions")
+
+
+class ShellCSuppressesAllowTests(unittest.TestCase):
+    """A shell `-c` body is opaque, so the hook must not vouch for it (Q60).
+
+    Measured at d076eb4: `cat in.txt; sh -c 'cat /q60-fake-target'` came back
+    `allow`, green-lighting an unreadable outside read. The body stays
+    unanalyzed — only the blanket `allow` goes away. Targets are synthetic
+    (repo rule); nothing here is ever executed.
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.workspace = os.path.realpath(self._tmp.name)
+        with open(os.path.join(self.workspace, "in.txt"), "w") as f:
+            f.write("hello\n")
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def _decision(self, cmd, expected):
+        out = run_hook(cmd, self.workspace, project_dir=self.workspace)
+        if expected == "defer":
+            self.assertIsNone(out, f"expected defer for {cmd!r}, got {out!r}")
+            return None
+        self.assertIsNotNone(out, f"expected a decision, got defer for: {cmd!r}")
+        got = out["hookSpecificOutput"]["permissionDecision"]
+        self.assertEqual(got, expected, f"expected {expected!r} for {cmd!r}")
+        return out["hookSpecificOutput"]["permissionDecisionReason"]
+
+    def test_a_clean_guarded_command_no_longer_speaks_for_a_body(self):
+        for cmd in ("cat in.txt; sh -c 'pkill -f ginkgo'",
+                    "grep foo in.txt && sh -c 'kill 1234'",
+                    "cat in.txt; sh -c 'cat /q60-fake-target'",
+                    "cat in.txt; sh -c 'echo x > /q60-fake-target'",
+                    "cat in.txt | xargs -I{} sh -c 'kill {}'",
+                    "cat in.txt; timeout 5 bash -c 'pkill -f ginkgo'",
+                    "cat in.txt; find . -exec sh -c 'kill 1' \\;"):
+            self._decision(cmd, "defer")
+
+    def test_a_body_on_its_own_still_defers(self):
+        # No guarded command to suppress; the body remains unanalyzed.
+        for cmd in ("sh -c 'pkill -f ginkgo'", "sh -c 'cat /q60-fake-target'",
+                    "bash -c 'kill $(pgrep -f ginkgo)'"):
+            self._decision(cmd, "defer")
+
+    def test_a_shell_without_the_c_flag_still_allows(self):
+        for cmd in ("cat in.txt; bash --version", "cat in.txt; sh --help",
+                    "cat in.txt; bash ./script.sh"):
+            self._decision(cmd, "allow")
+
+    def test_an_ordinary_guarded_command_still_allows(self):
+        self._decision("cat in.txt", "allow")
+        self._decision("grep -c foo in.txt", "allow")
 
 
 class SiblingSessionScratchE2ETests(unittest.TestCase):
@@ -6237,9 +7111,15 @@ class PowerShellSpecShapeTests(unittest.TestCase):
                              f"{name}: parameter is both a file and a value")
 
     def test_aliases_resolve_to_real_rows(self):
-        known = set(guard.PS_SPEC) | guard.PS_LOCATION_CMDS
+        known = set(guard.PS_SPEC) | guard.PS_LOCATION_CMDS | guard.PS_KILL_CMDS
         for alias, target in guard.PS_ALIASES.items():
             self.assertIn(target, known, f"alias {alias!r} -> unknown {target!r}")
+
+    def test_kill_selectors_are_declared_values(self):
+        # A selector missing from `consume` would leave its value in the
+        # positional stream, where a literal pid reads as the safe 'pid' mode —
+        # `Stop-Process -Name 1234` would defer.
+        self.assertTrue(guard.PS_KILL_SELECTORS <= guard.PS_KILL_SPEC["consume"])
 
     def test_posix_lookalike_aliases_do_not_reach_the_bash_spec(self):
         # `cat`, `rm`, `cp`, `mv`, `tee` name cmdlets with entirely different
@@ -6457,6 +7337,338 @@ class PowerShellPathPartsTests(unittest.TestCase):
 
     def test_quoted_operand_keeps_its_comma(self):
         self.assertEqual(guard.ps_path_parts(r"a,b.txt", True), [r"a,b.txt"])
+
+
+class PowerShellKillClassifyTests(unittest.TestCase):
+    """Selection classification for `Stop-Process` (Q57)."""
+
+    def classify(self, text):
+        toks = guard.ps_tokenize(text)
+        self.assertIsNotNone(toks, f"unexpected defer for {text!r}")
+        return guard.ps_classify_kill([t for t in toks if t[0] == "word"])
+
+    def test_pid_list_accepts_only_literal_digits(self):
+        for tok in ("1234", "12,34"):
+            self.assertTrue(guard.ps_pid_list(tok), tok)
+        for tok in ("", "node", "12,", "12a"):
+            self.assertFalse(guard.ps_pid_list(tok), tok)
+
+    def test_non_kill_returns_none(self):
+        self.assertIsNone(self.classify("Get-Process -Name node"))
+        self.assertIsNone(self.classify("Get-Content in.txt"))
+        self.assertIsNone(guard.ps_classify_kill([]))
+
+    def test_aliases_and_case_are_kills(self):
+        for text in ("Stop-Process -Name node", "stop-process -Name node",
+                     "kill -Name node", "spps -Name node"):
+            self.assertEqual(self.classify(text), ("name", ["node"]), text)
+
+    def test_literal_pid_needs_no_anchor(self):
+        for text in ("Stop-Process -Id 1234", "Stop-Process 1234",
+                     "Stop-Process -Id 1234,5678", "Stop-Process -Id:1234"):
+            self.assertEqual(self.classify(text)[0], "pid", text)
+
+    def test_expandable_pid_is_not_a_pid(self):
+        # `$p = Get-Process -Name node; Stop-Process -Id $p.Id` is host-wide, and
+        # the hook cannot tell it from a pid the agent looked up.
+        self.assertEqual(self.classify("Stop-Process -Id $p.Id"),
+                         ("other", ["$p.Id"]))
+
+    def test_name_binds_by_prefix_and_by_colon(self):
+        for text in ("Stop-Process -Na node", "Stop-Process -Name:node"):
+            self.assertEqual(self.classify(text), ("name", ["node"]), text)
+
+    def test_no_selector_reads_as_pipeline_input(self):
+        self.assertEqual(self.classify("Stop-Process"), ("other", []))
+        self.assertEqual(self.classify("Stop-Process -Force"), ("other", []))
+
+    def test_inputobject_is_anchorable_selection(self):
+        self.assertEqual(self.classify("Stop-Process -InputObject $p"),
+                         ("other", ["$p"]))
+
+    def test_ordinary_value_parameter_is_not_selection(self):
+        # Without `consume` handling, `SilentlyContinue` lands in the positional
+        # stream and drags a by-pid kill into a deny.
+        self.assertEqual(
+            self.classify("Stop-Process -ErrorAction SilentlyContinue -Id 1234"),
+            ("pid", []))
+
+    def test_switches_are_not_selection(self):
+        self.assertEqual(
+            self.classify("Stop-Process -Id 1234 -Force -PassThru -WhatIf"),
+            ("pid", []))
+
+    def test_stop_parsing_tail_is_selection_it_cannot_vouch_for(self):
+        self.assertEqual(self.classify("Stop-Process --% /IM node.exe")[0],
+                         "other")
+
+
+class PowerShellKillAnchorTests(unittest.TestCase):
+    """Expansion handling in the PowerShell anchor check (Q57)."""
+
+    def setUp(self):
+        # A slash-separated root, so `os.path.basename` finds `repo` on a POSIX
+        # test host as well as on Windows. Given `C:\ws\repo`, POSIX basename
+        # returns the whole string and every assertion below tests the wrong
+        # regex.
+        self.anchor = guard.workspace_anchor_re("/ws/repo")
+
+    def test_literal_path_anchors_with_either_separator(self):
+        for tok in (r"C:\ws\repo\bin\*", "C:/ws/repo/bin/*", r"repo\bin"):
+            self.assertTrue(
+                guard.ps_kill_operand_anchored(tok, False, self.anchor), tok)
+
+    def test_expandable_token_never_anchors(self):
+        # PowerShell decides at runtime where this lands, so the `\repo\` in it
+        # proves nothing — the same rule the file checks apply.
+        self.assertFalse(guard.ps_kill_operand_anchored(
+            r"$env:USERPROFILE\repo\bin", True, self.anchor))
+
+    def test_partial_component_does_not_anchor(self):
+        self.assertFalse(guard.ps_kill_operand_anchored(
+            r"C:\ws\repo-branch1\bin", False, self.anchor))
+
+    def test_unresolved_tilde_never_anchors(self):
+        self.assertFalse(guard.ps_kill_operand_anchored(
+            r"~someone\repo\bin", False, self.anchor))
+
+    def test_no_anchor_available_denies_everything(self):
+        self.assertFalse(guard.ps_kill_operand_anchored(
+            r"C:\ws\repo\bin", False, None))
+
+
+class PowerShellKillFixture(object):
+    """Workspace and hook-invocation harness for the PowerShell kill suites.
+
+    `wt-a` is this session's workspace and `wt-b` stands in for a sibling
+    worktree. No process is ever signalled: the hook reads the command as a JSON
+    string and the tests never invoke a shell on it. A mixin rather than a base
+    TestCase so the loader doesn't collect it, and so neither suite re-runs the
+    other's cases.
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.base = os.path.realpath(self._tmp.name)
+        self.workspace = os.path.join(self.base, "wt-a")
+        os.mkdir(self.workspace)
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def _glob(self, *parts):
+        return ps(os.path.join(self.base, *parts, "*"))
+
+    def _out(self, command, permission_mode=None, env_extra=None):
+        env = os.environ.copy()
+        env["CLAUDE_PROJECT_DIR"] = self.workspace
+        env.update(env_extra or {})
+        data = {"tool_name": "PowerShell", "cwd": self.workspace,
+                "tool_input": {"command": command}}
+        if permission_mode is not None:
+            data["permission_mode"] = permission_mode
+        r = subprocess.run([sys.executable, str(SCRIPT)], input=json.dumps(data),
+                           capture_output=True, text=True, env=env, timeout=10)
+        self.assertEqual(r.returncode, 0, f"hook errored: {r.stderr!r}")
+        out = r.stdout.strip()
+        return json.loads(out) if out else None
+
+    def _decision(self, command, expected, **kw):
+        out = self._out(command, **kw)
+        if expected == "defer":
+            self.assertIsNone(out, f"expected defer for {command!r}, got {out!r}")
+            return None
+        self.assertIsNotNone(out, f"expected {expected}, got defer for {command!r}")
+        got = out["hookSpecificOutput"]["permissionDecision"]
+        self.assertEqual(got, expected, f"expected {expected!r} for {command!r}")
+        return out["hookSpecificOutput"]["permissionDecisionReason"]
+
+
+class PowerShellUnanchoredKillEndToEndTests(PowerShellKillFixture,
+                                            unittest.TestCase):
+    """Decisions the script emits for a PowerShell `Stop-Process` (Q57)."""
+
+    def test_kill_by_name_denies(self):
+        for cmd in ("Stop-Process -Name node", "kill -Name node",
+                    "spps -Name node -Force"):
+            self._decision(cmd, "deny")
+
+    def test_pipeline_kill_denies(self):
+        # The idiomatic form, and the one an agent denied on -Name reaches for
+        # next. Leaving it would make the -Name deny train the bypass.
+        self._decision("Get-Process node | Stop-Process", "deny")
+
+    def test_anchored_pipeline_defers(self):
+        # Defer, not allow: an anchored kill is out of this hook's scope, and an
+        # `allow` would short-circuit the user's own permission settings on a
+        # destructive command.
+        self._decision(
+            "Get-Process | Where-Object { $_.Path -like %s } | Stop-Process"
+            % self._glob("wt-a"), "defer")
+
+    def test_sibling_worktree_filter_denies(self):
+        self._decision(
+            "Get-Process | Where-Object { $_.Path -like %s } | Stop-Process"
+            % self._glob("wt-b"), "deny")
+
+    def test_name_kill_denies_even_inside_an_anchored_pipeline(self):
+        # A process name carries no path, so nothing around it can scope it.
+        self._decision(
+            "Get-Process | Where-Object { $_.Path -like %s } | "
+            "Stop-Process -Name node" % self._glob("wt-a"), "deny")
+
+    def test_kill_by_literal_pid_is_untouched(self):
+        for cmd in ("Stop-Process -Id 1234", "Stop-Process 1234",
+                    "Get-Process -Name node"):
+            self._decision(cmd, "defer")
+
+    def test_expandable_pid_denies(self):
+        self._decision("Stop-Process -Id $p.Id", "deny")
+
+    def test_anchor_does_not_carry_across_a_statement_boundary(self):
+        for sep in (";", "\n", "&&"):
+            self._decision(
+                "Get-ChildItem %s%s Get-Process node | Stop-Process"
+                % (ps(self.workspace), sep), "deny")
+
+    def test_kill_in_a_script_block_is_seen(self):
+        self._decision(
+            "Get-Process node | ForEach-Object { Stop-Process -Id $_.Id }",
+            "deny")
+        self._decision(
+            "Get-Process | Where-Object { $_.Path -like %s } | "
+            "ForEach-Object { Stop-Process -Id $_.Id }" % self._glob("wt-a"),
+            "defer")
+
+    def test_kill_inside_a_subexpression_is_caught(self):
+        self._decision("Write-Output $(Stop-Process -Name node)", "deny")
+
+    def test_reason_names_the_powershell_rewrites(self):
+        r = self._decision("Stop-Process -Name node", "deny")
+        self.assertIn("node", r)
+        self.assertIn("Stop-Process -Id", r)
+        self.assertIn("Where-Object", r)
+        self.assertIn(self.workspace, r)
+        self.assertIn("WORKSPACE_GUARD_OVERRIDE", r)
+        self.assertNotIn("pgrep", r)      # the bash rewrite, wrong shell
+
+    def test_override_downgrades_to_ask(self):
+        out = self._out("Stop-Process -Name node",
+                        env_extra={"WORKSPACE_GUARD_OVERRIDE": "stuck harness"})
+        self.assertEqual(out["hookSpecificOutput"]["permissionDecision"], "ask")
+        self.assertIn("stuck harness",
+                      out["hookSpecificOutput"]["permissionDecisionReason"])
+
+    def test_bypass_mode_still_denies(self):
+        self._decision("Stop-Process -Name node", "deny",
+                       permission_mode="bypassPermissions")
+
+    # --- Q59: a clean guarded cmdlet never speaks for the kill ---------------
+
+    def test_a_clean_guarded_cmdlet_never_speaks_for_a_kill(self):
+        # These kills earn no offender — by literal pid, or anchored — but
+        # `allow` speaks for the WHOLE string and short-circuits the user's own
+        # permission settings, so the cmdlet must not launder them into one.
+        for cmd in (r"Get-Content .\in.txt; Stop-Process -Id 1234",
+                    r"Stop-Process -Id 1234; Get-Content .\in.txt",
+                    r"Get-Content .\in.txt && kill 1234",
+                    r"Get-Content .\in.txt; Get-Process | Where-Object "
+                    r"{ $_.Path -like %s } | Stop-Process" % self._glob("wt-a"),
+                    r"Get-Content .\in.txt; Get-Process | Where-Object "
+                    r"{ $_.Path -like %s } | ForEach-Object "
+                    r"{ Stop-Process -Id $_.Id }" % self._glob("wt-a")):
+            self._decision(cmd, "defer")
+
+    def test_a_kill_in_a_subexpression_suppresses_the_allow(self):
+        # The body is masked out of the outer text, so the clean cmdlet and the
+        # kill sit on opposite sides of the recursion.
+        self._decision(r"Get-Content .\in.txt; $(Stop-Process -Id 1234)",
+                       "defer")
+
+    def test_a_guarded_cmdlet_with_no_kill_still_allows(self):
+        self._decision(r"Get-Content .\in.txt", "allow")
+
+    def test_an_offending_kill_outranks_a_clean_cmdlet(self):
+        # Suppression removes the `allow`; it must not also swallow the deny.
+        self._decision(r"Get-Content .\in.txt; Stop-Process -Name node", "deny")
+
+
+class PowerShellTaskkillEndToEndTests(PowerShellKillFixture, unittest.TestCase):
+    """Decisions for `taskkill` through the PowerShell frontend (Q58).
+
+    The same verdicts the Bash frontend gives the same command — `taskkill` is
+    one program, and the two frontends must not disagree about it.
+    """
+
+    def test_image_name_denies(self):
+        for cmd in ("taskkill /IM node.exe", "taskkill /F /T /IM node.exe",
+                    "TASKKILL.EXE /IM node.exe"):
+            self._decision(cmd, "deny")
+
+    def test_filter_denies(self):
+        self._decision('taskkill /FI "IMAGENAME eq node.exe"', "deny")
+
+    def test_no_selector_denies(self):
+        self._decision("taskkill", "deny")
+
+    def test_kill_by_literal_pid_is_untouched(self):
+        for cmd in ("taskkill /PID 1234", "taskkill /F /PID 1234",
+                    "taskkill /?"):
+            self._decision(cmd, "defer")
+
+    def test_expandable_pid_denies(self):
+        self._decision("taskkill /PID $p", "deny")
+
+    def test_anchored_filter_defers(self):
+        self._decision("taskkill /FI %s"
+                       % ps("WINDOWTITLE eq %s"
+                            % os.path.join(self.base, "wt-a", "*")), "defer")
+
+    def test_sibling_worktree_filter_denies(self):
+        self._decision("taskkill /FI %s"
+                       % ps("WINDOWTITLE eq %s"
+                            % os.path.join(self.base, "wt-b", "*")), "deny")
+
+    def test_upstream_anchor_does_not_reach_a_taskkill(self):
+        # The divergence from `Stop-Process`: `taskkill` reads no pipeline, so a
+        # filter written upstream of it is not what selects the processes.
+        self._decision(
+            "Get-Process | Where-Object { $_.Path -like %s } | "
+            "taskkill /IM node.exe" % self._glob("wt-a"), "deny")
+
+    def test_reason_names_the_taskkill_rewrites(self):
+        r = self._decision("taskkill /IM node.exe", "deny")
+        self.assertIn("node.exe", r)
+        self.assertIn("taskkill /PID", r)
+        self.assertIn("tasklist", r)
+        self.assertNotIn("Where-Object", r)   # the Stop-Process rewrite
+
+    def test_override_downgrades_to_ask(self):
+        out = self._out("taskkill /IM node.exe",
+                        env_extra={"WORKSPACE_GUARD_OVERRIDE": "stuck harness"})
+        self.assertEqual(out["hookSpecificOutput"]["permissionDecision"], "ask")
+
+    def test_bypass_mode_still_denies(self):
+        self._decision("taskkill /IM node.exe", "deny",
+                       permission_mode="bypassPermissions")
+
+    def test_a_clean_guarded_cmdlet_never_speaks_for_a_taskkill(self):
+        # Q59's suppression has to reach this kill too: `taskkill /PID 1234`
+        # earns no offender, which is exactly what leaves it available for a
+        # clean `Get-Content` to launder into a blanket `allow`.
+        for cmd in (r"Get-Content .\in.txt; taskkill /PID 1234",
+                    r"taskkill /PID 1234; Get-Content .\in.txt",
+                    r"Get-Content .\in.txt | taskkill /PID 1234",
+                    r"Get-Content .\in.txt; $(taskkill /PID 1234)"):
+            self._decision(cmd, "defer")
+
+    def test_a_help_invocation_does_not_suppress_the_allow(self):
+        # `taskkill /?` kills nothing, so there is no kill to speak for.
+        self._decision(r"Get-Content .\in.txt; taskkill /?", "allow")
+
+    def test_an_offending_taskkill_outranks_a_clean_cmdlet(self):
+        # Suppression removes the `allow`; it must not also swallow the deny.
+        self._decision(r"Get-Content .\in.txt; taskkill /IM node.exe", "deny")
 
 
 class PowerShellEndToEndTests(unittest.TestCase):
