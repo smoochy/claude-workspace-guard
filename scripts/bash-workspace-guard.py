@@ -2046,13 +2046,26 @@ LITERAL_PID_RE = re.compile(r'^(?:\d+|%[-+%A-Za-z0-9_]*)$')
 # never needed. (Q60)
 GREP_LIKE = frozenset({'grep', 'rg'})
 
-# Shells whose `-c` operand is a command string the hook cannot read. The body is
-# one token to the tokenizer, so nothing in it is checked — which means the hook
-# must not speak for it either: a group carrying one clears `guarded`, so the
-# string defers instead of emitting the blanket `allow`. Same principle as the
-# signalling-command suppression above, applied to a second opaque construct.
-# The body itself stays unanalyzed; see README Limitations. (Q60)
+# Shells whose `-c` operand is a command string. The body is one token to the
+# tokenizer, so a group carrying one clears `guarded` and the string defers
+# instead of emitting the blanket `allow` — same principle as the
+# signalling-command suppression above, applied to a second opaque construct
+# (Q60). The body is additionally re-analyzed as its own command string when the
+# group runs it on this host; see `shell_c_bodies` (Q61).
 SHELL_C_CMDS = frozenset({'sh', 'bash', 'zsh', 'dash', 'ksh'})
+
+# Command words that run a shell `-c` body in THIS filesystem. The body is only
+# re-analyzed under one of these, because a path in it means nothing unless the
+# shell it names is the host's: `docker exec c sh -c 'cat /var/lib/…'` and
+# `kubectl exec p -- sh -c …` name paths inside a container, and `ssh h sh -c …`
+# a path on another machine. Naming the local wrappers rather than the remote
+# ones is what keeps a container runtime nobody has heard of yet from reading as
+# local — an unlisted wrapper leaves the body unanalyzed, which is where it
+# started. (Q61)
+LOCAL_SHELL_WRAPPERS = frozenset({
+    'env', 'find', 'ionice', 'nice', 'nohup', 'setsid', 'stdbuf', 'time',
+    'timeout', 'xargs',
+})
 
 # Stand-in for a grep-family pattern the hook cannot read — `grep -f patterns.txt`
 # takes its patterns from a file, and an invocation may carry no pattern operand
@@ -2062,15 +2075,49 @@ SHELL_C_CMDS = frozenset({'sh', 'bash', 'zsh', 'dash', 'ksh'})
 UNREADABLE_PATTERN = '(pattern the hook cannot read)'
 
 
+def signals_zero(args):
+    """True when a `kill`'s arguments `args` select signal 0 and nothing else.
+
+    Signal 0 sends no signal — it is the liveness/permission probe behind
+    `while kill -0 $(pgrep -f x)`, so however its pids were derived it can't be
+    laundering a kill. Both spellings count: the bare `-0` and the POSIX
+    `-s 0`/`-n 0`.
+
+    A second signal selector of any kind forfeits the exemption, because which
+    one bash honors depends on its spelling: a later `-s`/`-n` overrides an
+    earlier bare spec (`kill -0 -s 9` really does SIGKILL, measured), while a
+    later bare spec is read as a pid instead (`kill -0 -9 4321` signals nothing
+    and reports `-9` as no such process). Rather than model that per shell, take
+    the exemption only when there is nothing to arbitrate. (Q62)
+    """
+    selectors, i = [], 0
+    while i < len(args):
+        t = args[i]
+        if not t.startswith('-') or t in ('-', '--'):
+            break                             # first operand, or end of options
+        if t in ('-s', '-n'):                 # value form: the next token names it
+            i += 1
+            if i < len(args):
+                selectors.append(args[i])
+        elif t not in ('-l', '-L'):           # listing signals, not selecting one
+            selectors.append(t[1:])
+        i += 1
+    return bool(selectors) and all(s == '0' for s in selectors)
+
+
 def signal_command(tokens):
     """For a group that signals a process, return `(name, launderable)`; else None.
 
     `launderable` marks a kill whose target could have come from a pattern —
-    everything except a `kill` whose operands are all literal pids or job specs.
+    everything except a `kill` that sends no signal (see `signals_zero`) or whose
+    operands are all literal pids or job specs.
     `pkill`/`killall`/`taskkill` are never launderable: they carry their own
     anchor rule (`classify_pkill`, `classify_taskkill`), and folding them in here
     would let an unrelated unanchored pattern elsewhere in the string deny a
     correctly anchored one.
+
+    A signal-0 probe still returns a name, so it suppresses the blanket `allow`
+    the way every other signalling command does. Only the deny is lifted.
 
     An `xargs` group is inspected for a signal command word among its tokens
     rather than parsed for it. Both misparse directions of a real xargs option
@@ -2085,14 +2132,19 @@ def signal_command(tokens):
     if head in SIGNAL_CMDS:
         if head != 'kill':
             return (head, False)
+        if signals_zero(tokens[1:]):
+            return (head, False)
         operands = [t for t in tokens[1:] if not t.startswith('-')]
         launderable = bool(operands) and not all(
             LITERAL_PID_RE.match(t) for t in operands)
         return (head, launderable)
     if head == 'xargs':
-        for t in tokens[1:]:
-            if native_cmd_name(t) in SIGNAL_CMDS:
-                return (native_cmd_name(t), True)
+        for i, t in enumerate(tokens[1:], 1):
+            name = native_cmd_name(t)
+            if name in SIGNAL_CMDS:
+                # Only the arguments AFTER the kill are its own: `xargs -0 kill`
+                # is a real kill reading NUL-delimited pids, not a probe.
+                return (name, not (name == 'kill' and signals_zero(tokens[i+1:])))
     return None
 
 
@@ -2114,6 +2166,41 @@ def shell_c_group(tokens):
                for u in tokens[i+1:]):
             return True
     return False
+
+
+def shell_c_bodies(tokens):
+    """Bodies of the shell `-c` commands this group runs on this host.
+
+    The caller re-analyzes each as its own command string, so extraction is far
+    stricter than `shell_c_group`'s scan: that one only has to suppress `allow`,
+    and over-reporting costs it a defer, whereas a wrongly picked body is fed to
+    the tokenizer and can invent offenders out of text that is not a command at
+    all (`bash x.sh | grep -c FAIL` has both a shell and a `-c` in it). So the
+    `-c` must be an option of the shell ITSELF — found in the unbroken option run
+    that follows the shell word, ending at the first operand — and the body is
+    the token after it.
+
+    The group must also run the shell locally: its command word is a shell or one
+    of LOCAL_SHELL_WRAPPERS. Anything else (a container runtime, `ssh`, `sudo`)
+    yields nothing and the body stays unanalyzed.
+    """
+    if not tokens:
+        return []
+    head = os.path.basename(tokens[0])
+    if head not in SHELL_C_CMDS and head not in LOCAL_SHELL_WRAPPERS:
+        return []
+    out, n = [], len(tokens)
+    for i, t in enumerate(tokens):
+        if os.path.basename(t) not in SHELL_C_CMDS:
+            continue
+        j = i + 1
+        while j < n and tokens[j].startswith('-') and tokens[j] != '-':
+            if not tokens[j].startswith('--') and 'c' in tokens[j][1:]:
+                if j + 1 < n:
+                    out.append(tokens[j+1])
+                break
+            j += 1
+    return out
 
 
 def pgrep_operands(tokens):
@@ -2892,23 +2979,29 @@ def analyze_command(cmd, ctx, base_cwd, depth=0):
     return offenders, guarded and not kf.signal
 
 
-def _analyze_command(cmd, ctx, base_cwd, depth=0):
+def _analyze_command(cmd, ctx, base_cwd, depth=0, in_subst=False):
     """Analyze one command string; returns ``(offenders, guarded, KillFacts)``.
 
     Command-substitution bodies (``"$(…)"`` and backtick ``` `…` ```, plus the
-    bare ``$(…)`` the group loop also splits out) are recursively analyzed and
-    their offenders folded in — but their ``guarded`` flag is DISCARDED, so a
-    clean guarded command inside a substitution never flips a deferring outer
-    command into an ``allow``. Substitution analysis is strictly friction-adding.
+    bare ``$(…)`` the group loop also splits out) and shell ``-c`` bodies are
+    recursively analyzed and their offenders folded in — but their ``guarded``
+    flag is DISCARDED, so a clean guarded command inside one never flips a
+    deferring outer command into an ``allow``. Both recursions are strictly
+    friction-adding.
 
     Their KillFacts DO fold in, because the two halves of a laundered kill can
     sit on opposite sides of the recursion: in ``kill "$(pgrep -f ginkgo)"`` the
     quoting hides the source from the outer tokenizer, and neither half is an
     offender on its own.
+
+    ``in_subst`` says the string being analyzed is a command-substitution body,
+    whose output the enclosing command consumes by definition. Only that gives a
+    bare ``ps`` its provenance; a shell ``-c`` body inherits the flag rather than
+    setting it, since running a command string is not piping its output anywhere.
     """
     proj, cwd = ctx.proj, base_cwd
-    # Kept under its own name because the group loop below reuses `depth` as the
-    # paren-nesting counter, clobbering the parameter.
+    # Alias for readability at the two use sites far below; the group loop's own
+    # nesting counter is `paren` so that neither can shadow the other (Q63).
     subst_depth = depth
     if not cmd.strip():
         return [], False, KillFacts(None, None, [])
@@ -2948,19 +3041,19 @@ def _analyze_command(cmd, ctx, base_cwd, depth=0):
     # pipeline the group belongs to, which is what tells a `grep` filtering `ps`
     # output apart from a `grep` reading ordinary files.
     groups, cur, cur_redir, i = [], [], [], 0
-    depth, prev_sep, pipe = 0, '', 0
+    paren, prev_sep, pipe = 0, '', 0
     while i < len(tokens):
         t = tokens[i]
         if t in SEPARATORS:
             if cur or cur_redir:
-                persists = (depth == 0 and prev_sep != '|'
+                persists = (paren == 0 and prev_sep != '|'
                             and t in (';', '\n', '&&', '||'))
                 groups.append((cur, cur_redir, persists, pipe))
                 cur, cur_redir = [], []
             if t == '(':
-                depth += 1
+                paren += 1
             elif t == ')':
-                depth = max(0, depth - 1)
+                paren = max(0, paren - 1)
             if t != '|':
                 pipe += 1
             prev_sep = t
@@ -2994,7 +3087,7 @@ def _analyze_command(cmd, ctx, base_cwd, depth=0):
             i += 1; continue
         cur.append(t); i += 1
     if cur or cur_redir:
-        groups.append((cur, cur_redir, depth == 0 and prev_sep != '|', pipe))
+        groups.append((cur, cur_redir, paren == 0 and prev_sep != '|', pipe))
 
     def is_outside(rp):
         return path_is_outside(rp, proj)
@@ -3147,6 +3240,9 @@ def _analyze_command(cmd, ctx, base_cwd, depth=0):
     # `kill_pipes` numbers the pipelines holding a launderable kill, so a `ps`
     # only counts as that kill's pid source when pids can actually reach it.
     ps_pipes, grep_pats, kill_pipes = set(), [], set()
+    # `(body, cwd)` for every shell `-c` body this string runs locally, recursed
+    # into after the loop so each resolves against the cwd of its own group.
+    shell_bodies = []
     for g, g_redir, persists, pipe in groups:
         # Substitute known literals for path checking. The pre-substitution
         # tokens are kept for assignment parsing below — bash decides what is
@@ -3213,6 +3309,13 @@ def _analyze_command(cmd, ctx, base_cwd, depth=0):
             # signalling command does. Checked in the `elif` so a group that is
             # BOTH (`xargs sh -c 'kill …'`) keeps its signal classification.
             signal = signal or 'sh -c'
+        # The body is readable after all when it is a command string this host
+        # runs — queued whatever the classification above landed on, since the
+        # two answer different questions. Skipped once the cwd is untracked: the
+        # body's relative paths would resolve against a stale directory and read
+        # as in-workspace, and a wrong clean answer is worse than no answer.
+        if not group_cwd_unknown:
+            shell_bodies.extend((b, group_cwd) for b in shell_c_bodies(g))
         if os.path.basename(g[0]) == 'ps':
             ps_pipes.add(pipe)
         pg = pgrep_operands(g)
@@ -3339,7 +3442,7 @@ def _analyze_command(cmd, ctx, base_cwd, depth=0):
     # That requirement is load-bearing: without it the rule denies the commonest
     # debugging idiom there is — `./run.sh & p=$!; kill $p; ps -p $p` — where the
     # `ps` is a CONSUMER of an already-known pid, in its own group. (Q60)
-    if (ps_pipes & kill_pipes) or (subst_depth > 0 and ps_pipes):
+    if (ps_pipes & kill_pipes) or (in_subst and ps_pipes):
         patterns.append((UNREADABLE_PATTERN, False))
 
     # Recurse into command-substitution bodies — `"$(mktemp)"`, backtick
@@ -3357,17 +3460,37 @@ def _analyze_command(cmd, ctx, base_cwd, depth=0):
     # are scanned as their own units, with `quotes=False` — inside a heredoc
     # body bash applies no quoting, so an apostrophe there is text, not the
     # start of a quoted run that would swallow a later `$(…)`. (Q50)
-    if depth < MAX_SUBST_DEPTH:
+    if subst_depth < MAX_SUBST_DEPTH:
         heredocs = []
         subs = command_substitutions(strip_heredoc_bodies(cmd, expanded=heredocs))
         for hd in heredocs:
             subs.extend(command_substitutions(hd, quotes=False))
         for body in subs:
-            sub_off, _, sub_kf = _analyze_command(body, ctx, base_cwd, depth + 1)
+            sub_off, _, sub_kf = _analyze_command(body, ctx, base_cwd,
+                                                  subst_depth + 1, in_subst=True)
             outside.extend(sub_off)
             signal = signal or sub_kf.signal
             launder = launder or sub_kf.launder
             patterns.extend(sub_kf.patterns)
+
+    # Shell `-c` bodies (Q61). A body is an ordinary command string that happens
+    # to have arrived inside one token, so it gets the same treatment as a
+    # substitution body: offenders and KillFacts fold in, `guarded` is dropped.
+    # Dropping it is what keeps Q60 intact — a body reading only in-workspace
+    # files still leaves the string deferring rather than earning it an `allow`,
+    # so the hook never vouches for a string on the strength of a construct it
+    # reads at one remove. What carries in is the group's cwd, and whatever
+    # `substitute_vars` already put in the body token — over-substituting a
+    # single-quoted body errs toward FINDING a path, which is the safe way to be
+    # wrong; the body's own assignments are then the recursion's business.
+    if subst_depth < MAX_SUBST_DEPTH:
+        for body, body_cwd in shell_bodies:
+            b_off, _, b_kf = _analyze_command(body, ctx, body_cwd,
+                                              subst_depth + 1, in_subst)
+            outside.extend(b_off)
+            signal = signal or b_kf.signal
+            launder = launder or b_kf.launder
+            patterns.extend(b_kf.patterns)
     return outside, guarded, KillFacts(signal, launder, patterns)
 
 
