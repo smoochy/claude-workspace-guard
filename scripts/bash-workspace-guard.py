@@ -74,6 +74,7 @@ POISON_ALL_CMDS = frozenset({'eval', 'source', '.'})
 
 # Builtins/keywords that assign to variables named by their arguments
 # (`read f`, `for f in …`, `declare f=…`, `printf -v f …`, `unset f`, ...).
+# `printf` only assigns under `-v`, so it is gated on printf_assigns (Q65).
 ARG_ASSIGNER_CMDS = frozenset({
     'read', 'readarray', 'mapfile', 'getopts', 'declare', 'typeset',
     'local', 'readonly', 'export', 'unset', 'let', 'printf', 'for', 'select',
@@ -1102,10 +1103,10 @@ def strip_heredoc_bodies(cmd, expanded=None):
     Stripping the body from the RAW string up front (like ``strip_comments``)
     keeps shlex's input to shell syntax only. The `<<WORD` operator and its
     delimiter stay on the command line, so the redirect handling in
-    ``files_in_command``, the `<<`-delimiter skip there, and the
-    ``'<<' not in tokens`` propagation guard are all unchanged; a trailing
-    `<<EOF > out` redirect still parses. The body and its terminator line are
-    dropped.
+    ``files_in_command`` and the `<<`-delimiter skip there are unchanged; a
+    trailing `<<EOF > out` redirect still parses. The body and its terminator
+    line are dropped — which is what lets literal variable propagation stay live
+    across a heredoc (Q67): no body line ever reaches the group loop.
 
     Command-line quote state is tracked so a `<<` inside a quoted string is not
     mistaken for a heredoc; an unquoted `#` comment is skipped for `<<`
@@ -1654,6 +1655,40 @@ def apply_assignment_group(g, varmap, persists):
     return names
 
 
+def printf_assigns(args):
+    """True when a ``printf`` invocation could assign to a variable.
+
+    ``-v NAME`` is printf's only assigning form, and bash stops reading
+    options at the first non-option word — so ``printf "%s" "$f"`` cannot
+    assign however its arguments expand. Treating every printf as an
+    arg-assigner cost the map on any ``$`` argument, dropping ``f`` and
+    prompting on a later ``docs/$f`` (Q65).
+
+    Only the leading option region is scanned: ``--`` ends it, ``-v`` and the
+    glued ``-vNAME`` are the assigning form, and an option-region token still
+    holding a ``$`` is unresolvable — unquoted, it word-splits into ``-v
+    NAME`` and does assign — so it counts as one.
+    """
+    for t in args:
+        if t == '--':
+            return False
+        if t.startswith('-v') or '$' in t:
+            return True
+        if not t.startswith('-'):
+            return False
+    return False
+
+
+def unglue_printf_v(t):
+    """Strip a leading ``-v`` from a glued ``printf -vNAME`` argument.
+
+    bash accepts the name glued to the flag, and the assigned name is then
+    behind a ``-`` that ``IDENT_RE`` won't match past — so the name-poisoning
+    loops need it unstuck or ``printf -vf`` silently keeps ``f`` in the map.
+    """
+    return t[2:] if t.startswith('-v') and t != '-v' else t
+
+
 def poison_vars(g, varmap):
     """Conservatively drop map entries a (non-assignment) command group might
     mutate. Called on the post-substitution tokens so an expanded builtin
@@ -1668,17 +1703,31 @@ def poison_vars(g, varmap):
     ``f++``, or an ``f`` immediately followed by an ``=…`` token from a torn
     ``(( f = x ))``) poisons that name. Poisoning only removes entries, so
     it can only cause an `ask`, never an `allow`.
+
+    Inline env assignments come off before the dispatch too, or a prefix hides
+    the command behind it — ``LC_ALL=C read f`` matched no rule and left ``f``
+    on the map at its stale in-workspace literal, so a later ``cat $f/x``
+    allowed where the bare ``read f`` asked (Q69). The prefix names are still
+    poisoned: bash scopes such an assignment to the one command, but a special
+    builtin under ``set -o posix`` keeps it.
     """
     if not varmap:
         return
-    rest = strip_sh_keywords(g)
+    kw_g = strip_sh_keywords(g)
+    rest = strip_env_prefix(kw_g)
+    for t in kw_g[:len(kw_g) - len(rest)]:
+        varmap.pop(t.split('=', 1)[0], None)
     if rest:
         name0 = os.path.basename(rest[0])
         if name0 in POISON_ALL_CMDS:
             varmap.clear()
             return
-        if name0 in ARG_ASSIGNER_CMDS:
-            for t in rest[1:]:
+        args = rest[1:]
+        if name0 in ARG_ASSIGNER_CMDS and (
+                name0 != 'printf' or printf_assigns(args)):
+            if name0 == 'printf':
+                args = [unglue_printf_v(t) for t in args]
+            for t in args:
                 if '$' in t:
                     varmap.clear()
                     return
@@ -1718,8 +1767,14 @@ def clobbers_ifs(g):
 
     ``unset`` is exempt: bash word-splits on the default IFS while IFS is
     unset, and the default is what the hook already models.
+
+    An inline env assignment is scoped to its own command and bash splits that
+    command's words with the old IFS, so an ``IFS=x cat …`` prefix leaves
+    nothing for later groups to mis-split. It still has to come off before the
+    dispatch, or it hides a command that does persist — ``LC_ALL=C read IFS``
+    (Q69).
     """
-    rest = strip_sh_keywords(g)
+    rest = strip_env_prefix(strip_sh_keywords(g))
     if not rest:
         return False
     name0 = os.path.basename(rest[0])
@@ -1727,7 +1782,12 @@ def clobbers_ifs(g):
         return True
     if name0 == 'unset' or name0 not in ARG_ASSIGNER_CMDS:
         return False
-    for t in rest[1:]:
+    args = rest[1:]
+    if name0 == 'printf':
+        if not printf_assigns(args):
+            return False
+        args = [unglue_printf_v(t) for t in args]
+    for t in args:
         if '$' in t:
             return True
         m = IDENT_RE.match(t)
@@ -2979,7 +3039,7 @@ def analyze_command(cmd, ctx, base_cwd, depth=0):
     return offenders, guarded and not kf.signal
 
 
-def _analyze_command(cmd, ctx, base_cwd, depth=0, in_subst=False):
+def _analyze_command(cmd, ctx, base_cwd, depth=0, in_subst=False, seed_vars=None):
     """Analyze one command string; returns ``(offenders, guarded, KillFacts)``.
 
     Command-substitution bodies (``"$(…)"`` and backtick ``` `…` ```, plus the
@@ -2998,6 +3058,12 @@ def _analyze_command(cmd, ctx, base_cwd, depth=0, in_subst=False):
     whose output the enclosing command consumes by definition. Only that gives a
     bare ``ps`` its provenance; a shell ``-c`` body inherits the flag rather than
     setting it, since running a command string is not piping its output anywhere.
+
+    ``seed_vars`` pre-loads the literal-variable map, so a ``$f`` a substitution
+    body inherits from the enclosing string resolves there too (Q66). Only the
+    substitution recursion passes it, and only the string-wide stable names
+    (see ``track_stable``); a shell ``-c`` body instead carries whatever
+    ``substitute_vars`` already put in its token, at its own position.
     """
     proj, cwd = ctx.proj, base_cwd
     # Alias for readability at the two use sites far below; the group loop's own
@@ -3222,11 +3288,35 @@ def _analyze_command(cmd, ctx, base_cwd, depth=0, in_subst=False):
     outside, guarded = [], False
     group_cwd, group_cwd_unknown = cwd, False
     # Literal variable propagation (issue 58): values of `NAME=literal`
-    # assignments seen so far in this command string. Heredocs disable the
-    # whole feature — their body lines tokenize as commands, so a body line
-    # shaped like an assignment could otherwise pollute the map with values
-    # bash never assigns.
-    varmap, propagate = {}, '<<' not in tokens
+    # assignments seen so far in this command string. A heredoc used to disable
+    # the whole feature, because body lines tokenized as commands and one shaped
+    # like an assignment would pollute the map with a value bash never assigns.
+    # `strip_heredoc_bodies` now drops every body from the raw string before
+    # shlex, so no body line reaches this loop and the map survives a heredoc
+    # (Q67). The `<<` left on the command line is the operator itself, or an
+    # arithmetic shift the stripper copies verbatim — neither carries data.
+    varmap, propagate = dict(seed_vars) if seed_vars else {}, True
+    # The subset of `varmap` the command-substitution recursion is allowed to
+    # start from (Q66). That scan runs once for the whole string, after this
+    # loop, so it has no position at which to snapshot the live map — it gets
+    # only the names holding the same literal at every point in the string. A
+    # name reassigned to a different value, or dropped by a poisoning command,
+    # is blacklisted for good, so a stale value can never stand in for the real
+    # one: `f=/outside/x; cat "$(cat $f)"; f=docs/ok` keeps its `ask` instead of
+    # resolving `$f` to the later, in-workspace literal.
+    stable_vars, unstable_vars = {}, set()
+
+    def track_stable():
+        """Fold the live `varmap` into `stable_vars`. Called before each group
+        and once after the last, so every intermediate state is seen."""
+        for name in list(stable_vars):
+            if varmap.get(name) != stable_vars[name]:
+                del stable_vars[name]
+                unstable_vars.add(name)
+        for name, val in varmap.items():
+            if name not in unstable_vars:
+                stable_vars[name] = val
+
     # Loop-variable propagation (issue 70): a `for NAME in <all-literal list>`
     # records NAME's candidate value set here instead of poisoning it, so a
     # later `$NAME` in a file arg is checked against every value bash iterates.
@@ -3244,6 +3334,7 @@ def _analyze_command(cmd, ctx, base_cwd, depth=0, in_subst=False):
     # into after the loop so each resolves against the cwd of its own group.
     shell_bodies = []
     for g, g_redir, persists, pipe in groups:
+        track_stable()
         # Substitute known literals for path checking. The pre-substitution
         # tokens are kept for assignment parsing below — bash decides what is
         # an assignment before expansion.
@@ -3416,6 +3507,7 @@ def _analyze_command(cmd, ctx, base_cwd, depth=0, in_subst=False):
             o = check_file(f, group_cwd, group_cwd_unknown, is_read=f_is_read)
             if o is not None:
                 outside.append(o)
+    track_stable()                                # state after the last group
 
     # A grep's pattern is a pid source only when it filters `ps` output, which is
     # a property of the whole pipeline — resolved here so a `ps` segment counts
@@ -3454,6 +3546,11 @@ def _analyze_command(cmd, ctx, base_cwd, depth=0, in_subst=False):
     # `base_cwd`; only its OFFENDERS bubble up — its `guarded` is dropped, so a
     # clean substitution never produces an `allow`. (Q33)
     #
+    # Each body also starts from the string's stable literal variables, since a
+    # substitution inherits them: without that, `f=docs/x; echo "$(grep p "$f")"`
+    # prompts on an unresolvable `$f` where the same command without the `$( )`
+    # allows (Q66).
+    #
     # Heredoc bodies come out of the command line first: a `cat <<'EOF'` body is
     # literal data to bash, so a `$(…)` written there never runs, while a
     # `<<EOF` body is expanded and does need scanning (Q35). The expanded ones
@@ -3467,7 +3564,8 @@ def _analyze_command(cmd, ctx, base_cwd, depth=0, in_subst=False):
             subs.extend(command_substitutions(hd, quotes=False))
         for body in subs:
             sub_off, _, sub_kf = _analyze_command(body, ctx, base_cwd,
-                                                  subst_depth + 1, in_subst=True)
+                                                  subst_depth + 1, in_subst=True,
+                                                  seed_vars=stable_vars)
             outside.extend(sub_off)
             signal = signal or sub_kf.signal
             launder = launder or sub_kf.launder
@@ -3872,7 +3970,7 @@ def _ps_scan_paren(text, start):
     return None
 
 
-def ps_subexpressions(text, depth=0):
+def ps_subexpressions(text):
     """Split `$(…)` / `@(…)` out of `text`.
 
     Returns `(masked, bodies)`. Each subexpression is replaced by a bare `$` so
@@ -3880,6 +3978,15 @@ def ps_subexpressions(text, depth=0):
     returned for analysis in its own right — the same strictly-friction-adding
     treatment bash command substitutions get, and for the same reason: a guarded
     cmdlet written inside one is invisible to the outer tokenizer.
+
+    Only the OUTERMOST subexpressions are returned, matching
+    `command_substitutions`: a nested `$(… $(…) …)` is found by re-scanning the
+    returned body, which `_ps_analyze_command` already does when it recurses.
+    Returning descendants here too made that recursion re-flatten them at every
+    level, so a body `n` deep was analyzed once per ancestor — 20 nested `$(…)`
+    cost a million analyses and about 9 seconds, and a hook that stalls is one
+    Claude Code gives up on as a non-blocking error, leaving the guard enforcing
+    nothing. (Q64)
     """
     out, bodies, i, n = [], [], 0, len(text)
     while i < n:
@@ -3901,10 +4008,7 @@ def ps_subexpressions(text, depth=0):
                 out.append(c)
                 i += 1
                 continue
-            body = text[i + 2:j - 1]
-            bodies.append(body)
-            if depth < MAX_SUBST_DEPTH:
-                bodies.extend(ps_subexpressions(body, depth + 1)[1])
+            bodies.append(text[i + 2:j - 1])
             out.append('$')
             i = j
             continue
@@ -3922,10 +4026,7 @@ def ps_subexpressions(text, depth=0):
                     k = _ps_scan_paren(text, j + 1)
                     if k is None:
                         break
-                    body = text[j + 2:k - 1]
-                    bodies.append(body)
-                    if depth < MAX_SUBST_DEPTH:
-                        bodies.extend(ps_subexpressions(body, depth + 1)[1])
+                    bodies.append(text[j + 2:k - 1])
                     seg.append('$')
                     j = k
                     continue

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Tests for scripts/bash-workspace-guard.py.
 
-Run with: python3 -m unittest discover tests
+Run with: python3 scripts/run-tests.py
      or:  python3 tests/test_workspace_guard.py
 
 Three layers:
@@ -3802,6 +3802,110 @@ class QuotedSubstBodyEndToEndTests(unittest.TestCase):
         self._defer('echo "$((1 + 2))"')
 
 
+class SubstBodyVarPropagationTests(unittest.TestCase):
+    """Q66: a substitution body inherits the string's literal variables.
+
+    `f=in.txt; echo "$(cat "$f")"` asked on an unresolvable `$f` where the same
+    command without the `$( )` allowed. The body scan runs once for the whole
+    string, so it gets only the names holding one literal throughout — a
+    reassigned or poisoned name stays unresolvable and keeps its `ask`.
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.workspace = os.path.realpath(self._tmp.name)
+        with open(os.path.join(self.workspace, "in.txt"), "w") as f:
+            f.write("hello\n")
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def _defer(self, cmd):
+        out = run_hook(cmd, self.workspace, project_dir=self.workspace)
+        self.assertIsNone(out, f"expected defer for {cmd!r}, got {out!r}")
+
+    def _asks_about(self, cmd, path):
+        out = run_hook(cmd, self.workspace, project_dir=self.workspace)
+        self.assertIsNotNone(out, f"expected a decision, got defer for: {cmd!r}")
+        got = out["hookSpecificOutput"]["permissionDecision"]
+        self.assertEqual(got, "ask", f"expected ask for {cmd!r}; got {got!r}")
+        self.assertIn(path, out["hookSpecificOutput"]["permissionDecisionReason"])
+
+    # --- the motivating shapes stop prompting --------------------------------
+
+    def test_quoted_subst_resolves_tracked_var(self):
+        self._defer('f=in.txt; echo "$(cat "$f")"')
+
+    def test_backtick_subst_resolves_tracked_var(self):
+        self._defer('f=in.txt; echo "`cat "$f"`"')
+
+    def test_var_holding_a_directory_prefix_resolves(self):
+        self._defer('d=.; echo "$(cat $d/in.txt)"')
+
+    def test_nested_subst_inherits_too(self):
+        # `allow` rather than the defer the single-level case gets: the
+        # alternating quotes of a nested substitution let shlex split the inner
+        # `cat` out as a top-level group, so its `guarded` is not the
+        # substitution recursion's to drop. Pre-fix this asked on `$f`.
+        out = run_hook('f=in.txt; echo "$(echo "$(cat "$f")")"',
+                       self.workspace, project_dir=self.workspace)
+        self.assertIsNotNone(out)
+        self.assertEqual(out["hookSpecificOutput"]["permissionDecision"], "allow")
+
+    def test_nested_subst_outside_value_still_asks(self):
+        self._asks_about('f=/etc/q66-fake-target; echo "$(echo "$(cat "$f")")"',
+                         "/etc/q66-fake-target")
+
+    # --- an outside value still blocks ---------------------------------------
+
+    def test_outside_value_inside_subst_asks(self):
+        self._asks_about('f=/etc/q66-fake-target; echo "$(cat "$f")"',
+                         "/etc/q66-fake-target")
+
+    # --- only string-wide stable names carry in ------------------------------
+
+    def test_later_reassignment_does_not_launder_the_earlier_value(self):
+        # The body runs while `f` still holds the outside path; substituting the
+        # later in-workspace literal would drop the offender entirely. Being
+        # unstable, `f` is not substituted at all, so the block survives as the
+        # generic runtime-expanded `ask` rather than one naming the path.
+        self._asks_about('f=/etc/q66-fake-target; echo "$(cat "$f")"; f=in.txt',
+                         "$f")
+
+    def test_reassignment_leaves_the_var_unresolvable(self):
+        # Both values are in-workspace, so nothing is hidden — but the name is
+        # no longer stable, so the body keeps the runtime-expanded `ask`.
+        self._asks_about('f=in.txt; echo "$(cat "$f")"; f=other.txt', "$f")
+
+    def test_poisoned_var_stays_unresolvable(self):
+        self._asks_about('f=in.txt; read f; echo "$(cat "$f")"', "$f")
+
+    def test_ifs_clobber_stops_propagation_into_the_body(self):
+        self._asks_about('f=in.txt; IFS=:; echo "$(cat "$f")"', "$f")
+
+    def test_pipeline_segment_assignment_does_not_reach_the_body(self):
+        # `f=…` in a pipeline segment runs in a subshell, so bash never sets it
+        # for the substitution that follows.
+        self._asks_about('true | f=in.txt; echo "$(cat "$f")"', "$f")
+
+    def test_single_quoted_body_is_still_a_literal(self):
+        self._defer("f=/etc/q66-fake-target; echo '$(cat \"$f\")'")
+
+    # --- heredoc bodies get the map too, now that Q67 keeps it alive ---------
+
+    def test_expanded_heredoc_body_subst_resolves_the_var(self):
+        self._asks_about('f=/etc/q66-fake-target\ncat <<EOF\n$(cat "$f")\nEOF',
+                         "/etc/q66-fake-target")
+
+    def test_quoted_heredoc_body_stays_literal(self):
+        # A `<<'EOF'` body is data to bash, so its `$(…)` never runs and the
+        # seeded map must not conjure an offender out of it.
+        out = run_hook("f=/etc/q66-fake-target\ncat <<'EOF'\n$(cat \"$f\")\nEOF",
+                       self.workspace, project_dir=self.workspace)
+        self.assertIsNotNone(out)
+        self.assertEqual(out["hookSpecificOutput"]["permissionDecision"], "allow")
+
+
 class SubstDepthCapTests(unittest.TestCase):
     """`MAX_SUBST_DEPTH` bounds the substitution recursion (Q63).
 
@@ -3831,9 +3935,9 @@ class SubstDepthCapTests(unittest.TestCase):
         depths = []
         real = guard._analyze_command
 
-        def spy(cmd, ctx, base_cwd, depth=0, in_subst=False):
+        def spy(cmd, ctx, base_cwd, depth=0, *a, **kw):
             depths.append(depth)
-            return real(cmd, ctx, base_cwd, depth, in_subst)
+            return real(cmd, ctx, base_cwd, depth, *a, **kw)
 
         ctx = guard.build_context(
             {"cwd": self.workspace, "tool_input": {}})
@@ -3845,9 +3949,9 @@ class SubstDepthCapTests(unittest.TestCase):
         depths = []
         real = guard._analyze_command
 
-        def spy(cmd, ctx, base_cwd, depth=0, in_subst=False):
+        def spy(cmd, ctx, base_cwd, depth=0, *a, **kw):
             depths.append(depth)
-            return real(cmd, ctx, base_cwd, depth, in_subst)
+            return real(cmd, ctx, base_cwd, depth, *a, **kw)
 
         ctx = guard.build_context(
             {"cwd": self.workspace, "tool_input": {}})
@@ -5854,9 +5958,9 @@ class SiblingSessionScratchE2ETests(unittest.TestCase):
 
     Creates a synthetic ``<tmp_root>/<slug>/<session>/`` layout under the real
     Claude temp root so the hook's directory scan (claude_session_project_dir)
-    can anchor on the current session; cleaned up in tearDown. The slug carries
-    os.getpid() to avoid colliding with real session dirs or parallel runs. No
-    real outside paths are used as targets (repo rule)."""
+    can anchor on the current session; cleaned up in tearDown. The slug and both
+    session ids carry os.getpid() to avoid colliding with real session dirs or
+    parallel runs. No real outside paths are used as targets (repo rule)."""
 
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
@@ -5866,8 +5970,12 @@ class SiblingSessionScratchE2ETests(unittest.TestCase):
         self.root = guard.claude_tmp_root()
         self.slug = "-guardtest-sibling-%d" % os.getpid()
         self.proj_dir = os.path.join(self.root, self.slug)
-        self.current = "cccccccc-1111-2222-3333-444444444444"
-        self.worker = "wwwwwwww-1111-2222-3333-444444444444"
+        # The scan anchors on the session id, not on the slug, so a sharded run
+        # where two workers plant the same id under their own slugs resolves to
+        # whichever listdir returns first. Both ids carry the pid for that.
+        tag = "%012x" % os.getpid()
+        self.current = "cccccccc-1111-2222-3333-" + tag
+        self.worker = "wwwwwwww-1111-2222-3333-" + tag
         # The current session's own scratch dir (scan anchor) and a sibling
         # worker session's dir, both under the same project slug.
         os.makedirs(os.path.join(self.proj_dir, self.current, "tasks"),
@@ -6145,6 +6253,22 @@ class PoisonVarsTests(unittest.TestCase):
         guard.poison_vars(["for", "f", "in", "a", "b"], m)
         self.assertNotIn("f", m)
 
+    def test_env_prefix_skipped_before_dispatch(self):
+        # Q69: an inline env assignment must not hide the assigning command.
+        for pre in (["LC_ALL=C"], ["LC_ALL=C", "TZ=UTC"], ["while", "LC_ALL=C"]):
+            for cmd in (["read", "-r", "f"], ["printf", "-v", "f", "%s", "y"],
+                        ["unset", "f"], ["source", "lib.sh"], ["eval", "echo"]):
+                with self.subTest(prefix=pre, cmd=cmd):
+                    m = {"f": "x"}
+                    guard.poison_vars(pre + cmd, m)
+                    self.assertEqual(m, {})
+
+    def test_env_prefix_name_still_poisoned(self):
+        # A special builtin under `set -o posix` keeps the prefix assignment.
+        m = {"f": "x", "g": "y"}
+        guard.poison_vars(["f=/y", "read", "g"], m)
+        self.assertEqual(m, {})
+
     def test_prefix_assignment_poisons(self):
         m = {"f": "x"}
         guard.poison_vars(["f=/y", "cat", "z"], m)
@@ -6167,6 +6291,48 @@ class PoisonVarsTests(unittest.TestCase):
         guard.poison_vars(["grep", "PAT", "y.txt"], m)
         self.assertEqual(m, {"f": "x"})
 
+    def test_printf_without_v_leaves_map_alone(self):
+        # Q65: only `-v` assigns, and bash stops reading options at the format,
+        # so nothing after it can name a variable.
+        for args in (["%s\n", "f"], ["%s\n", "$UNSET"], ["value: %s", "$HOME"],
+                     ["--", "-v", "f"], ["%s", "-v", "f"]):
+            with self.subTest(args=args):
+                m = {"f": "x"}
+                guard.poison_vars(["printf"] + args, m)
+                self.assertEqual(m, {"f": "x"})
+
+    def test_printf_v_forms_still_poison(self):
+        for args in (["-v", "f", "%s", "y"], ["-vf", "%s", "y"]):
+            with self.subTest(args=args):
+                m = {"f": "x"}
+                guard.poison_vars(["printf"] + args, m)
+                self.assertEqual(m, {})
+
+    def test_printf_option_region_dollar_clears_map(self):
+        # Unquoted, `$fmt` word-splits into `-v f` and does assign.
+        m = {"f": "x"}
+        guard.poison_vars(["printf", "$fmt", "%s", "y"], m)
+        self.assertEqual(m, {})
+
+
+class PrintfAssignsTests(unittest.TestCase):
+    """`printf` assigns only under `-v`, read from the option region (Q65)."""
+
+    def test_assigning_forms(self):
+        for args in (["-v", "f", "%s"], ["-vf", "%s"], ["$fmt", "%s"],
+                     ["-v", "$n", "%s"]):
+            self.assertTrue(guard.printf_assigns(args), args)
+
+    def test_non_assigning_forms(self):
+        for args in ([], ["%s\n", "f"], ["%s", "$f"], ["--", "-v", "f"],
+                     ["%s", "-v", "f"]):
+            self.assertFalse(guard.printf_assigns(args), args)
+
+    def test_unglue_v(self):
+        self.assertEqual(guard.unglue_printf_v("-vf"), "f")
+        self.assertEqual(guard.unglue_printf_v("-v"), "-v")
+        self.assertEqual(guard.unglue_printf_v("%s"), "%s")
+
 
 class ClobbersIfsTests(unittest.TestCase):
     """Groups that set IFS outside the plain/`export` assignment forms (Q49)."""
@@ -6175,8 +6341,14 @@ class ClobbersIfsTests(unittest.TestCase):
         for cmd in (["declare", "IFS=x"], ["local", "IFS=x"],
                     ["typeset", "IFS=x"], ["readonly", "IFS=x"],
                     ["declare", "-x", "IFS=x"], ["read", "IFS"],
-                    ["printf", "-v", "IFS", "x"], ["for", "IFS", "in", "a"]):
+                    ["printf", "-v", "IFS", "x"], ["printf", "-vIFS", "x"],
+                    ["for", "IFS", "in", "a"]):
             self.assertTrue(guard.clobbers_ifs(cmd), cmd)
+
+    def test_printf_without_v_does_not_clobber_ifs(self):
+        # Q65: reading `$IFS` is not setting it.
+        for cmd in (["printf", "%s", "$IFS"], ["printf", "%s\n", "IFS"]):
+            self.assertFalse(guard.clobbers_ifs(cmd), cmd)
 
     def test_eval_and_source_clobber(self):
         for cmd in ("eval", "source", "."):
@@ -6188,6 +6360,17 @@ class ClobbersIfsTests(unittest.TestCase):
 
     def test_keyword_prefix_skipped_before_dispatch(self):
         self.assertTrue(guard.clobbers_ifs(["while", "read", "IFS"]))
+
+    def test_env_prefix_skipped_before_dispatch(self):
+        # Q69: `LC_ALL=C read IFS` sets IFS for every later group.
+        for cmd in (["LC_ALL=C", "read", "IFS"], ["LC_ALL=C", "source", "lib.sh"],
+                    ["LC_ALL=C", "TZ=UTC", "declare", "IFS=x"],
+                    ["while", "LC_ALL=C", "read", "IFS"]):
+            self.assertTrue(guard.clobbers_ifs(cmd), cmd)
+
+    def test_ifs_env_prefix_alone_does_not_clobber(self):
+        # The assignment is scoped to `cat`, which bash splits with the old IFS.
+        self.assertFalse(guard.clobbers_ifs(["IFS=x", "cat", "y.txt"]))
 
     def test_unset_is_exempt(self):
         # bash splits on the default IFS while IFS is unset, which is the
@@ -6503,6 +6686,14 @@ class VarPropagationEndToEndTests(unittest.TestCase):
     def test_eval_clears_all(self):
         self._decision("f=in.txt; eval echo hi; cat $f", "ask")
 
+    def test_env_prefix_does_not_hide_the_poisoning_command(self):
+        # Q69: the prefix left `read`/`source` unrecognised, so `f` kept its
+        # stale in-workspace literal and the later `cat` allowed.
+        for cmd in ("read f", "read -r f", "printf -v f /etc/q69-fake",
+                    "unset f", "source lib.sh", "eval echo hi"):
+            with self.subTest(cmd=cmd):
+                self._decision(f"f=in.txt; LC_ALL=C {cmd}; cat $f", "ask")
+
     def test_unset_poisons_var(self):
         self._decision("f=in.txt; unset f; cat $f", "ask")
 
@@ -6511,6 +6702,22 @@ class VarPropagationEndToEndTests(unittest.TestCase):
 
     def test_printf_v_poisons(self):
         self._decision("f=in.txt; printf -v f /etc/q58-fake; cat $f", "ask")
+
+    def test_printf_v_glued_poisons(self):
+        # bash accepts the name glued to the flag: `printf -vf x` sets f.
+        self._decision("f=in.txt; printf -vf /etc/q58-fake; cat $f", "ask")
+
+    def test_printf_without_v_keeps_var(self):
+        # Q65: a plain printf assigns nothing, so the map survives it.
+        for pf in ('printf "%s\\n" f', 'printf "%s\\n" "$q65_unset"',
+                   'printf "value: %s" "$HOME"', "printf -- -v f",
+                   'printf "%s" -v f'):
+            with self.subTest(pf=pf):
+                self._decision(f"f=in.txt; {pf}; cat $f", "allow")
+
+    def test_printf_unresolvable_format_still_poisons(self):
+        # Unquoted, `$fmt` word-splits into `-v f` and does assign.
+        self._decision('f=in.txt; printf $fmt "%s" y; cat $f', "ask")
 
     def test_array_element_assignment_poisons(self):
         # `f[0]=…` mutates f (a scalar f is f[0]).
@@ -6547,14 +6754,46 @@ class VarPropagationEndToEndTests(unittest.TestCase):
         self._decision(
             "declare IFS=x; f=docs/x/opt/q49-fake-target; cat $f", "ask")
 
+    def test_env_prefixed_ifs_setter_disables_propagation(self):
+        # Q69: same setters, hidden behind an inline env assignment.
+        for setter in ("declare IFS=x", "read IFS", "eval 'IFS=x'"):
+            with self.subTest(setter=setter):
+                self._decision(f"LC_ALL=C {setter}; f=in.txt; cat $f", "ask")
+
+    def test_ifs_env_prefix_keeps_propagation(self):
+        # The assignment is scoped to `true`, and bash splits that command's
+        # own words with the old IFS, so later groups are unaffected.
+        self._decision("IFS=x true; f=in.txt; cat $f", "allow")
+
     def test_unset_ifs_keeps_propagation(self):
         # Unsetting IFS restores the default splitting the hook models.
         self._decision("unset IFS; f=in.txt; cat $f", "allow")
 
-    def test_heredoc_disables_propagation(self):
-        # Heredoc bodies tokenize as commands; a body line shaped like an
-        # assignment could pollute the map, so `<<` turns the feature off.
-        self._decision('f=in.txt; cat $f <<EOF\nx\nEOF', "ask")
+    def test_heredoc_keeps_propagation(self):
+        # Q67: bodies are stripped from the raw string before shlex, so no body
+        # line reaches the group loop and the map survives the `<<`.
+        self._decision('f=in.txt; cat $f <<EOF\nx\nEOF', "allow")
+
+    def test_heredoc_before_use_keeps_propagation(self):
+        self._decision('f=in.txt\ncat <<EOF > out.txt\nx\nEOF\ncat $f', "allow")
+
+    def test_heredoc_body_assignment_does_not_seed_map(self):
+        # The body is data: `f=in.txt` written there assigns nothing, so `$f`
+        # must stay unresolved rather than being laundered into an allow.
+        self._decision('cat <<EOF > out.txt\nf=in.txt\nEOF\ncat "$f"', "ask")
+
+    def test_heredoc_keeps_outside_value_flagged(self):
+        self._decision(
+            'f=/etc/q67-fake-target\ncat <<EOF > out.txt\nx\nEOF\ncat $f', "ask")
+
+    def test_arithmetic_shift_keeps_propagation(self):
+        # `$((1<<2))` leaves a `<<` token in the stream but is a shift, not a
+        # heredoc — the old token scan turned propagation off for it too.
+        self._decision('f=in.txt; n=$((1<<2)); cat $f', "allow")
+
+    def test_heredoc_then_ifs_still_disables_propagation(self):
+        self._decision('f=in.txt\ncat <<EOF > out.txt\nx\nEOF\nIFS=,\ncat $f',
+                       "ask")
 
     def test_prefix_assignment_does_not_persist(self):
         # `F=… cat …` exports F only into cat's environment; a later $F is
@@ -6839,10 +7078,16 @@ class ForLoopPropagationEndToEndTests(unittest.TestCase):
         self._decision(
             "for ((i=0;i<3;i++))\ndo\n  cat $i\ndone", "ask")
 
-    def test_heredoc_disables_loop_propagation(self):
-        # Heredoc turns off the whole propagation feature (varmap AND loopmap).
+    def test_heredoc_keeps_loop_propagation(self):
+        # Q67: the stripped body can't pollute the maps, so loopmap survives a
+        # heredoc the same way varmap does.
         self._decision(
-            "for f in a b\ndo\n  cat $f <<EOF\nx\nEOF\ndone", "ask")
+            "for f in a b\ndo\n  cat $f <<EOF\nx\nEOF\ndone", "allow")
+
+    def test_heredoc_keeps_outside_candidate_tainting(self):
+        self._decision(
+            "for f in a ../../../etc/q67-fake\ndo\n  cat $f <<EOF\nx\nEOF\ndone",
+            "ask")
 
     def test_one_outside_candidate_taints_whole_loop(self):
         # bash visits every value, so a single outside candidate must prompt
@@ -7029,12 +7274,12 @@ class CIWiringTests(unittest.TestCase):
     The job runs through the skip ceiling instead."""
 
     def test_windows_job_runs_the_suite_through_the_skip_ceiling(self):
-        self.assertTrue((REPO / "scripts" / "skip-ceiling.py").is_file(),
-                        "missing scripts/skip-ceiling.py")
+        self.assertTrue((REPO / "scripts" / "run-tests.py").is_file(),
+                        "missing scripts/run-tests.py")
         workflow = (REPO / ".github" / "workflows" / "tests.yml").read_text()
         self.assertRegex(
-            workflow, r"skip-ceiling\.py --max-skips \d+",
-            "the Windows job must run the suite through skip-ceiling.py",
+            workflow, r"run-tests\.py --max-skips \d+",
+            "the Windows job must run the suite through --max-skips",
         )
 
     def test_windows_suite_also_runs_under_git_bash(self):
@@ -7046,7 +7291,7 @@ class CIWiringTests(unittest.TestCase):
         # Windows environments it has to be right in.
         workflow = (REPO / ".github" / "workflows" / "tests.yml").read_text()
         self.assertRegex(
-            workflow, r"skip-ceiling\.py --max-skips \d+\n\s+shell: bash",
+            workflow, r"run-tests\.py --max-skips \d+\n\s+shell: bash",
             "a Windows job must run the suite under Git Bash (shell: bash)",
         )
 
@@ -7481,15 +7726,87 @@ class PowerShellSubexpressionTests(unittest.TestCase):
         _, bodies = guard.ps_subexpressions(r'$(Get-Content "a)b" C:\x)')
         self.assertEqual(bodies, [r'Get-Content "a)b" C:\x'])
 
-    def test_nested_bodies_are_extracted(self):
+    def test_only_the_outermost_body_is_returned(self):
+        # Descendants are the caller's business: it re-scans each body it
+        # recurses into. Returning them here as well made that recursion
+        # quadratic in bodies and exponential in nesting depth (Q64).
         _, bodies = guard.ps_subexpressions(r"$(a $(Get-Content C:\x))")
-        self.assertIn(r"Get-Content C:\x", bodies)
+        self.assertEqual(bodies, [r"a $(Get-Content C:\x)"])
+
+    def test_a_nested_body_is_found_by_re_scanning(self):
+        _, bodies = guard.ps_subexpressions(r"$(a $(Get-Content C:\x))")
+        self.assertEqual(guard.ps_subexpressions(bodies[0])[1],
+                         [r"Get-Content C:\x"])
 
     def test_unbalanced_quote_is_not_closed_for_the_tokenizer(self):
         # Fabricating the missing quote here would hand the tokenizer a
         # balanced string and turn a defer into a parse.
         masked, _ = guard.ps_subexpressions('Get-Content "unterminated')
         self.assertIsNone(guard.ps_tokenize(masked))
+
+
+class PowerShellSubexpressionRecursionTests(unittest.TestCase):
+    """Nested `$(…)` costs one analysis per level, not 2^n (Q64).
+
+    `ps_subexpressions` used to return every descendant body alongside the
+    outermost ones, and `_ps_analyze_command` then recursed into each and
+    re-flattened it — so a body `n` deep was analyzed once per ancestor. 20
+    levels meant 1,048,576 analyses and about 9 seconds, and a hook that stalls
+    is one Claude Code abandons as a non-blocking error, leaving the guard
+    enforcing nothing. Counting calls rather than clocking them keeps this
+    honest on a loaded CI box, where a timing assertion is either flaky or too
+    loose to catch a regression.
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.workspace = os.path.realpath(self._tmp.name)
+        self.ctx = guard.build_context(
+            {"cwd": self.workspace, "tool_input": {}})
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    @staticmethod
+    def _nest(levels, inner="Get-Content /q64-fake-target"):
+        return "$(" * levels + inner + ")" * levels
+
+    def _depths(self, command):
+        depths = []
+        real = guard._ps_analyze_command
+
+        def spy(cmd, ctx, base_cwd, depth=0):
+            depths.append(depth)
+            return real(cmd, ctx, base_cwd, depth)
+
+        with mock.patch.object(guard, "_ps_analyze_command", spy):
+            guard.ps_analyze_command(command, self.ctx, self.workspace)
+        return depths
+
+    def test_each_nesting_level_is_analyzed_exactly_once(self):
+        # Pre-fix: 4096 calls for 12 levels. One per level plus the outer
+        # command is the whole budget.
+        self.assertEqual(len(self._depths(self._nest(12))), 13)
+
+    def test_recursion_stops_at_the_cap(self):
+        # Two-sided, matching the bash side's cap test: neither a cap that
+        # stopped firing nor one that runs away slips back in.
+        self.assertEqual(max(self._depths(self._nest(60))),
+                         guard.MAX_SUBST_DEPTH)
+
+    def test_an_offender_nested_at_the_cap_is_still_found(self):
+        offenders, guarded = guard.ps_analyze_command(
+            self._nest(guard.MAX_SUBST_DEPTH), self.ctx, self.workspace)
+        self.assertTrue(offenders)
+        self.assertFalse(guarded)
+
+    def test_nesting_past_the_cap_defers_rather_than_allows(self):
+        # The unanalyzed tail must never read as clean: `allow` speaks for the
+        # whole string, and past the cap the guard has not looked at it.
+        offenders, guarded = guard.ps_analyze_command(
+            self._nest(guard.MAX_SUBST_DEPTH + 1), self.ctx, self.workspace)
+        self.assertFalse(offenders)
+        self.assertFalse(guarded)
 
 
 class PowerShellBindArgsTests(unittest.TestCase):

@@ -15,6 +15,12 @@ Nothing else in the repo encodes the version (no README badge, no `__version__`)
 grep -rn '"version"' .claude-plugin/
 ```
 
+## Pre-flight: the session must be able to push
+
+**Check this before drafting anything.** Steps 7 and 8 push to `main` and push a tag, and branch-guard confirms any push whose target isn't the worktree branch. Under `auto`/`dontAsk` there is nobody to answer, so both are denied outright — a release started in the wrong mode gets all the way through notes, review, and merge before it discovers it cannot finish.
+
+Run the release interactively, or plan to hand steps 7–9 to a terminal. Everything up to and including the notes pull request (PR) works in any mode; only the last three steps need the prompt.
+
 ## Steps
 
 1. **Start from a fresh `main`.** Releases must include everything merged. Rebase the worktree:
@@ -26,7 +32,7 @@ grep -rn '"version"' .claude-plugin/
 2. **Run the full test suite — it must be green.**
 
    ```
-   python3 -m unittest discover tests
+   python3 scripts/run-tests.py
    ```
 
 3. **Pick `X.Y.Z`.** Patch (`Z`) for fixes, docs, and packaging; minor (`Y`) for new guarded commands or hook surface; major (`X`) for a default-behavior change. Most releases are patch. The notes file is named after it, so the choice comes first.
@@ -54,7 +60,7 @@ grep -rn '"version"' .claude-plugin/
    git push origin vX.Y.Z
    ```
 
-   **Both pushes need an interactive permission mode.** branch-guard confirms any push whose target isn't the worktree branch, which covers `main` *and* the tag. Under `auto`/`dontAsk` there is nobody to answer, so both are denied outright — retrying won't help. Run the session interactively, or hand the two commands over to be run in a terminal. Create the tag in its own command: chained as `git tag … && git push …`, the deny takes out the `git tag` too and the tag never gets created.
+   This push and the one in step 7 both need an interactive permission mode (see §Pre-flight); retrying under `auto` won't help. Create the tag in its own command: chained as `git tag … && git push …`, the deny takes out the `git tag` too and the tag never gets created.
 
 9. **Create the GitHub Release** on that tag, marked latest, from the notes file:
 
@@ -80,7 +86,33 @@ The invariants:
 - A bullet per notable PR: `* <title> by @<author> in <PR-url>`. Curate — highlight user-facing changes; routine chores can be folded into the changelog link.
 - A trailing `**Full Changelog**: https://github.com/karlkfi/claude-workspace-guard/compare/v<PREV>...vX.Y.Z` line. It 404s until the tag is pushed; that is expected while the notes PR is in review.
 
-To enumerate what shipped since the last tag:
+### Start from the notes their authors wrote
+
+Every PR body ends with a `## Release note` block — see [`.github/pull_request_template.md`](../../.github/pull_request_template.md) — holding one line written at PR time, while the author still had the change in their head. Harvest those first. They are the notes, not raw material for them:
+
+```
+for pr in $(git log --oneline v<PREV>..HEAD | grep -oE '\(#[0-9]+\)' | grep -oE '[0-9]+'); do
+  printf '#%s  ' "$pr"
+  gh pr view "$pr" --json body --jq .body | python3 scripts/release-note.py
+done
+```
+
+`scripts/release-note.py` is the same extractor the `release-note` CI check runs on every PR, so the harvest and the gate can't drift into disagreeing about what counts as an answer. It strips the template's instructions, which stay in the body as an HTML comment even after the author answers.
+
+Two of the four outcomes are answers; the other two are failures, and they mean different things:
+
+| output | meaning | what to do |
+|---|---|---|
+| a note line | the hook behaves differently for someone running it | it is the bullet — edit for the release's voice, don't rewrite from the diff |
+| `None` | no decision moved, nothing an operator sees changed | fold the PR into the changelog link |
+| `!! UNANSWERED` | the section is there and empty — nobody answered it | read the diff; also ask how it merged, since the `release-note` check should have blocked it |
+| `!! NO SECTION` | no section at all: the PR predates the template, or the author dropped it | reconstruct from the diff, the way every release before the template was written |
+
+The `release-note` CI check rejects both failure states at PR time, so a release should see only the top two rows. The bottom two are still worth handling: every PR merged before that check existed has no section, and a merge that bypassed checks can still land one. Treat either as a signal about the gate, not just about the one PR.
+
+`None` is a claim about the release notes, not about the code — it says "this PR needs no bullet." That is what keeps it checkable at tag time: a `None` sitting next to a diff that moves a decision is a mistake you can actually see, and it is the one failure CI cannot catch for you.
+
+To enumerate what shipped since the last tag, and to catch anything the harvest missed:
 
 ```
 git log --oneline v<PREV>..HEAD

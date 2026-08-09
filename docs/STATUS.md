@@ -5,7 +5,7 @@ Single source of truth for progress and priorities in workspace-guard. Pick the 
 **Status:** 🔲 ready · 🚫 blocked
 **Size:** S = one session/PR · M = 2–3 sessions · L = needs a plan doc under `docs/plan/`
 **Labels:** `security` `tests` `docs` `infra` `bug` `parsing` `retro`
-**Next ID:** Q65
+**Next ID:** Q72
 
 **Maintaining this file:** see [`docs/development/maintaining-backlog.md`](development/maintaining-backlog.md).
 
@@ -15,7 +15,6 @@ Specific actionable items in priority order. Pick from the top; skip 🚫 items 
 
 | ID | Item | Labels | St | Sz | Notes |
 |---|---|---|---|---|---|
-| <a id="Q64"></a>Q64 | Stop PowerShell subexpression analysis going exponential | `bug` `security` | 🔲 | S | 2^n: `ps_subexpressions` flattens every descendant, then `_ps_analyze_command` recurses into each and re-flattens. 20 nested `$(…)` takes 11s, 25 over 20s — a stalled hook enforces nothing. |
 
 ## Deferred
 
