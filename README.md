@@ -177,6 +177,10 @@ project's scratch still asks entirely.
 | `mktemp -dp ./scratch x.XXXX` (clustered `-d -p`) | allow |
 | `cat /tmpfoo/x` (not under `/tmp`)   | **ask**  |
 | `ls > /etc/out.txt` (unguarded redirect, outside) | **ask** |
+| `rm <sibling-worktree>/main.go` (in a worktree) | **deny** |
+| `rm -rf <sibling-worktree>` (the whole checkout) | **deny** |
+| `rm ~/.claude/skills/x` (a symlink into a sibling) | **ask** |
+| `rm <link-to-sibling>/main.go` (real file inside) | **deny** |
 | `pkill -f ginkgo` · `pkill -f "make check"` | **deny** |
 | `pkill -f "<sibling-worktree>/bin/x"` | **deny** |
 | `pkill -u karl` (no pattern at all)  | **deny** |
@@ -355,6 +359,16 @@ a worktree, and a path in an *unrelated* git repo is never treated as a sibling
 (it shares no git common-dir with your repo). For deliberate cross-checkout work,
 `WORKSPACE_GUARD_OVERRIDE=<reason>` downgrades the deny to `ask`; see
 [Configuration](#configuration).
+
+**An operand that is itself a symlink is judged by the link, not its target**,
+for the commands that act on the name rather than the contents: `rm`'s operands
+and `mv`'s sources. `rm link` unlinks the link and cannot write what it points
+at, so `rm ~/.claude/skills/<name>`, where that name is a symlink into a repo
+you have a worktree of, is an ordinary outside-workspace `ask` rather than a
+sibling deny. Everything above the last component still resolves, so
+`rm <link-to-checkout>/main.go` is a real file inside the sibling and still
+denies. `mv`'s **destination** keeps resolving too, because `mv x <link>` writes
+into the directory the link names.
 
 ### Unanchored process-kill deny
 
@@ -844,7 +858,11 @@ through the same boundary rules and produce the same reasons. Symlink staging
    hook time, so a naive `realpath` would otherwise place `LINK` lexically
    inside the workspace and let it through.
 8. **Resolve** every file argument against `$CLAUDE_PROJECT_DIR` with
-   `realpath`, collapsing `../` and following symlinks. Anything that resolves
+   `realpath`, collapsing `../` and following symlinks. The exception is an
+   operand naming a directory *entry* rather than file contents — `rm`'s
+   operands and `mv`'s sources, which unlink or rename the name they are given
+   and never write through it. Those resolve every component but the last, so
+   the link rather than its target is what gets checked. Anything that resolves
    outside the root yields `ask`; otherwise `allow`. A leading `~` or `~/…` is
    expanded to your home directory first (bash does this deterministically), so
    a home path inside the root is allowed instead of needlessly prompted. The
@@ -936,11 +954,15 @@ through the same boundary rules and produce the same reasons. Symlink staging
    [Configuration](#configuration).
 12. **Deny** writes into a sibling checkout of the same repo. When the session
    root is inside a git worktree, the hook resolves the enclosing git checkout of
-   each *write* path (walking up to the nearest `.git`, reading only tiny git
-   metadata) and compares its shared `--git-common-dir` to the session's. A path
-   inside a *different* checkout of the *same* repo (same common-dir, different
-   root) is reclassified to `deny`, naming the checkout, its branch, and the
-   corrected in-session path. Only writes upgrade — reads keep step 8's `ask`.
+   each *write* path (walking up from the path itself to the nearest `.git`,
+   reading only tiny git metadata) and compares its shared `--git-common-dir` to
+   the session's. A path
+   inside *or equal to* a *different* checkout of the *same* repo (same
+   common-dir, different root) is reclassified to `deny`, naming the checkout,
+   its branch, and the
+   corrected in-session path. Removing a whole sibling worktree is therefore the
+   same decision as removing one file inside it. Only writes upgrade — reads
+   keep step 8's `ask`.
    A path in an unrelated repo has a different common-dir and stays a generic
    outside `ask`. The same rule is the sole active check on the `Edit`, `Write`,
    `MultiEdit`, and `NotebookEdit` tools. `WORKSPACE_GUARD_OVERRIDE=<reason>`
@@ -971,7 +993,16 @@ through the same boundary rules and produce the same reasons. Symlink staging
    carry an `xargs kill` past your permission settings — `allow` speaks for the
    whole string. A shell `-c` body suppresses it the same way: it arrives as one
    token, and even once step 15 has read it the hook has no basis to vouch for a
-   construct it reads at one remove. A `Stop-Process` or a `taskkill` suppresses
+   construct it reads at one remove. **Interpreter code suppresses it on the same
+   grounds** — `python3 -c`, `perl -e`, a heredoc fed to `python3`, or a script
+   resolving outside the root, in the Bash tool. Interpreters are not guarded
+   commands and a bare `python3 x.py` still defers to your own permission rules;
+   what the hook withdraws is only its willingness to *vouch* for them, so
+   `cat README.md && python3 -c '…'` no longer runs silently. A script path that
+   resolves **inside** the workspace is exempt — that is repo-resident code the
+   boundary already trusts — as is an interpreter run on another filesystem
+   (`ssh`, `docker exec`, `kubectl exec`) and a `--version`/`--help` query.
+   A `Stop-Process` or a `taskkill` suppresses
    the PowerShell `allow` too,
    including one this step had no cause to deny and one written inside a `$(…)`
    body. The pid *sources* then go through the anchor test above: `pgrep`'s
@@ -1204,8 +1235,21 @@ A set of path prefixes are always allowed for **read-only** guarded commands
 write-mode flag (`sed -i`, gawk `-i inplace`, `yq -i`, `sort -o`), and the
 positional output file of `uniq IN OUT` / `xxd IN OUT` are never exempt.
 
-The built-in default is `~/.claude/projects/` (Claude Code's own session and
-sub-agent data). You can extend it with additional prefixes:
+The built-in defaults are `~/.claude/projects/` (Claude Code's own session and
+sub-agent data) and `~/.claude/plugins/` + `~/.claude/skills/` (installed
+extension code). The extension dirs rest on the same trust boundary as the
+plugin itself — that code is installed by the user, deliberately — and they are
+load-bearing rather than a convenience: a hook or skill routinely launches its
+own scripts by absolute path, so without the exemption every such launch would
+prompt.
+
+The exemption keys on where a file **really** is, because file arguments are
+compared after `realpath`. A skill symlinked out to a working repo
+(`~/.claude/skills/foo -> ~/workspace/skills/foo`, a common layout) resolves to
+the repo and is *not* exempt — correctly, since that is an ordinary cross-repo
+read, and an exempt directory must never launder a symlink into one.
+
+You can extend the defaults with additional prefixes:
 
 | Env var | Default | Effect |
 | --- | --- | --- |
@@ -1290,6 +1334,29 @@ final output.
 
 ## Limitations
 
+- **An interpreter's own file access is invisible to the hook.** `python3`,
+  `node`, `perl`, `ruby` and friends are not guarded commands: a `PreToolUse`
+  hook on the shell sees the command line, and whatever the interpreter then
+  opens happens inside its own process. So `python3 -c 'open("/etc/passwd")'`
+  is not checked against the boundary, and neither is any file a script it runs
+  touches. This is the [documented threat model](docs/design.md) rather than an
+  oversight — the plugin closes a granularity gap in *pre-approved file
+  readers*, and it does not try to model every program that can open a file.
+  What the hook *does* check is the **script path** an interpreter is told to
+  run — `python3 <path>` reads that file, so it is checked like any other read
+  and an outside-workspace script gets the usual `ask`. Installed extension code
+  is read-exempt (see [Allowed read prefixes](#allowed-read-prefixes)), which is
+  what keeps a hook launching its own script quiet.
+  Separately, interpreter code suppresses the blanket `allow` a clean guarded
+  command in the same string would otherwise earn, so the hook never vouches for
+  code it cannot read. Note the asymmetry: the path check produces a real
+  decision that blocks in every permission mode, while the suppression only
+  withholds `allow` and so protects nothing under `auto`, `acceptEdits`, or
+  `bypassPermissions` — see
+  [`docs/permission-modes.md`](docs/permission-modes.md).
+  Residuals, all erring toward silence: inline code (`python3 -c`, a heredoc)
+  carries no path to check, `python3 -m <module>` is not treated as inline, and
+  the PowerShell tool does not yet apply the suppression.
 - A leading `~`/`~/…` is expanded to your home directory (bash does this
   deterministically), so a home path inside the root is allowed. Tokens that
   bash would expand *unpredictably* at runtime — `~user`/`~+`/`~-`, or a `$`
@@ -1384,7 +1451,12 @@ final output.
   nested past the cap goes unanalyzed, and the command defers rather than
   earning an `allow` on the strength of a body the guard never read.
 - `realpath` only follows symlinks for files that already exist; nonexistent
-  paths are normalized lexically (fine for read-style commands).
+  paths are normalized lexically (fine for read-style commands). A *dangling*
+  link is not that case: the link itself exists, so it is followed and the
+  missing target is what gets checked.
+- Entry-operand resolution covers `rm` and `mv` on the Bash frontend only.
+  PowerShell's `Remove-Item`/`Move-Item` bind through their own spec and still
+  resolve every component, so removing a symlink there is judged by its target.
 - Redirect targets (`> file`) are inspected on *every* command, guarded or not —
   a redirect is a write the shell performs regardless of the command word, so
   `echo secret > /tmp/out` (host temp → deny) and `ls > /etc/out.txt` (outside →
@@ -1425,11 +1497,21 @@ final output.
   never widens the boundary). A session with no `session_id` (older CLIs)
   disables both allows entirely.
 - In non-interactive / headless runs there is no one to answer an `ask` prompt,
-  so an `ask` still **blocks** the command (verified on CLI 2.1.159 — it does
-  not silently allow). Under `--dangerously-skip-permissions`
-  (`bypassPermissions`) the hook emits `deny` rather than `ask` for
-  outside-workspace paths: equally blocking, but the agent receives the reason
-  and can recover instead of stalling. See [Configuration](#configuration).
+  so an `ask` still **blocks** the command (re-verified on CLI 2.1.220 across
+  all six permission modes — it does not silently allow). Under
+  `--dangerously-skip-permissions` (`bypassPermissions`) the hook emits `deny`
+  rather than `ask` for outside-workspace paths: equally blocking, but the agent
+  receives the reason and can recover instead of stalling. See
+  [Configuration](#configuration).
+- **How much the hook protects you depends on your permission mode.** `ask` and
+  `deny` block in every mode, but a *deferred* command — one the hook declines
+  to judge — runs silently under `auto`, `acceptEdits`, and `bypassPermissions`,
+  and is blocked only under `manual`, `dontAsk`, and `plan`. So the mechanisms
+  that work by declining to vouch (the suppressions described in step 16) add
+  protection only in the latter group; in a pre-approving mode they hand the
+  decision back to rules that already said yes. The measured matrix, and which
+  decision is the right one per mode, are in
+  [`docs/permission-modes.md`](docs/permission-modes.md).
 - The host-temp `deny` covers guarded-command file arguments, redirect targets
   from any command (`go test > /tmp/log`), a `cd` into host temp followed by a
   relative write, `mktemp` (its default location is host temp), and — as of the

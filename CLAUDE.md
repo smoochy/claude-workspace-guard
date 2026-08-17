@@ -4,10 +4,6 @@ A Claude Code plugin that adds a `PreToolUse` hook for `Bash`. When a guarded co
 
 The load-bearing piece is `scripts/bash-workspace-guard.py` — a stdlib-only Python script that tokenizes the command with `shlex`, classifies tokens against a per-command `SPEC` table, resolves file arguments with `realpath`, and emits a `PreToolUse` decision.
 
-## Model selection
-
-Use the `model-advisor` skill to assess the right model and thinking level at session start and whenever the task type shifts significantly (e.g. moving from a small `SPEC` row addition to redesigning the tokenizer).
-
 ## Development philosophy
 
 Build the right thing AND build it well. Before writing any code, state the goal in one sentence and the approach in two or three. If the goal is unclear, ask one focused question rather than guessing.
@@ -64,7 +60,7 @@ When in doubt, ask before shipping. The hook's job is to add friction at the sec
 
 ## Testing
 
-Tests live in `tests/test_workspace_guard.py` (stdlib `unittest`, no third-party deps). Run with:
+Tests live in `tests/` (stdlib `unittest`, no third-party deps) — `test_workspace_guard.py` for the hook, and one file per helper script alongside it, including `test_shell_scripts.py` for the `scripts/*.sh` helpers. Everything is picked up by discovery, so a new `tests/test_*.py` runs in CI with no workflow change. Run with:
 
 ```
 python3 scripts/run-tests.py
@@ -117,6 +113,7 @@ When working on specific tasks, read the relevant doc before starting:
 | Picking the next task, tracking progress, adding new items | `docs/STATUS.md` — also run `gh pr list` and skip any Queue item already covered by an open PR |
 | Editing `docs/STATUS.md` (any change to the Queue or header) | `docs/development/maintaining-backlog.md` |
 | Changing parsing behavior or the `SPEC` table | `scripts/bash-workspace-guard.py` + `README.md` decision table |
+| Choosing or changing a decision (`allow`/`ask`/`deny`/defer) | `docs/permission-modes.md` — defer is a no-op in `auto`/`acceptEdits`/`bypassPermissions`, so "declines to vouch" protects nothing there |
 | Plugin packaging / marketplace listing | `.claude-plugin/plugin.json`, `.claude-plugin/marketplace.json` |
 | Cutting a release (version bump, notes file, tag, GitHub Release) | `docs/development/release-process.md` |
 | Measuring where prompts accumulate (friction review) | `docs/development/measuring-friction.md` + `scripts/friction-report.py` |

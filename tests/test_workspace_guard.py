@@ -4792,6 +4792,18 @@ class SiblingCheckoutTests(unittest.TestCase):
         self.main = os.path.realpath(self.main)
         self.wt = os.path.realpath(self.wt)
         self.other = os.path.realpath(self.other)
+        # Links living OUTSIDE every checkout, standing in for the documented
+        # `~/.claude/skills/<name> -> <repo>/<name>` install layout.
+        self.links = os.path.join(self.base, "links")
+        os.mkdir(self.links)
+        os.symlink(os.path.join(self.main, "root.txt"),
+                   os.path.join(self.links, "live"))
+        os.symlink(os.path.join(self.main, "gone.txt"),
+                   os.path.join(self.links, "dangling"))
+        os.symlink(self.main, os.path.join(self.links, "dirlink"))
+        # And one inside the session's own checkout, pointing at the sibling.
+        os.symlink(os.path.join(self.main, "root.txt"),
+                   os.path.join(self.wt, "inlink"))
 
     def tearDown(self):
         # Worktrees hold no locks once the subprocesses exit; plain cleanup is
@@ -4906,6 +4918,80 @@ class SiblingCheckoutTests(unittest.TestCase):
         out = self._bash(f"rm -f {sh(os.path.join(self.main, 'root.txt'))}")
         self.assertEqual(self._decision(out), "deny")
 
+    # --- Bash: an operand that IS a link is judged by the link ---------------
+    # `rm link` unlinks the link and never writes the target, so resolving the
+    # operand through to a sibling checkout denied a removal that lands nothing
+    # on the wrong branch.
+
+    def test_bash_rm_of_link_into_sibling_is_not_denied(self):
+        out = self._bash(f"rm {sh(os.path.join(self.links, 'live'))}")
+        self.assertEqual(self._decision(out), "ask")
+        self.assertNotIn("Sibling-checkout", self._reason(out))
+
+    def test_bash_rm_of_dangling_link_into_sibling_is_not_denied(self):
+        # The target does not exist, so there is nothing there to protect.
+        out = self._bash(f"rm {sh(os.path.join(self.links, 'dangling'))}")
+        self.assertEqual(self._decision(out), "ask")
+        self.assertNotIn("Sibling-checkout", self._reason(out))
+
+    def test_bash_rm_of_link_to_sibling_checkout_root_is_not_denied(self):
+        out = self._bash(f"rm {sh(os.path.join(self.links, 'dirlink'))}")
+        self.assertEqual(self._decision(out), "ask")
+        self.assertNotIn("Sibling-checkout", self._reason(out))
+
+    def test_bash_mv_of_link_source_into_sibling_is_not_denied(self):
+        src = os.path.join(self.links, "live")
+        dst = os.path.join(self.links, "renamed")
+        out = self._bash(f"mv {sh(src)} {sh(dst)}")
+        self.assertEqual(self._decision(out), "ask")
+        self.assertNotIn("Sibling-checkout", self._reason(out))
+
+    def test_bash_rm_of_link_inside_own_checkout_is_allowed(self):
+        # The link lives in this session's worktree; unlinking it is an
+        # in-workspace write however far its target points.
+        out = self._bash("rm ./inlink")
+        self.assertEqual(self._decision(out), "allow")
+
+    # The protection this must not weaken: a *directory* link in the path, with
+    # a real file inside the sibling as the operand.
+    def test_bash_rm_through_directory_link_still_denies(self):
+        target = os.path.join(self.links, "dirlink", "root.txt")
+        out = self._bash(f"rm {sh(target)}")
+        self.assertEqual(self._decision(out), "deny")
+        self.assertIn("Sibling-checkout", self._reason(out))
+
+    def test_bash_mv_destination_still_follows_link_into_sibling(self):
+        # `mv src dirlink/x` writes INTO the checkout the link names, so the
+        # destination keeps resolving. Only `mv`'s sources are entry operands.
+        dst = os.path.join(self.links, "dirlink", "copy.txt")
+        out = self._bash(f"mv root.txt {sh(dst)}")
+        self.assertEqual(self._decision(out), "deny")
+        self.assertIn("Sibling-checkout", self._reason(out))
+
+    # --- Bash: a checkout ROOT is inside its own checkout -------------------
+    # The walk used to start at dirname(), which for a checkout root is one
+    # level too high, so removing a whole sibling escaped the rule while
+    # removing one file inside it was denied.
+
+    def test_bash_rm_of_sibling_worktree_root_denies(self):
+        out = self._bash(f"rm -rf {sh(self.other)}")
+        self.assertEqual(self._decision(out), "deny")
+        r = self._reason(out)
+        self.assertIn("Sibling-checkout", r)
+        self.assertIn("feat-b", r)
+
+    def test_bash_rm_of_primary_checkout_root_denies(self):
+        out = self._bash(f"rm -rf {sh(self.main)}")
+        self.assertEqual(self._decision(out), "deny")
+        self.assertIn(self.main_branch, self._reason(out))
+
+    def test_bash_cp_into_sibling_checkout_root_denies(self):
+        # Same walk change, reached by a content operand: the destination names
+        # the checkout directory itself.
+        out = self._bash(f"cp root.txt {sh(self.other)}")
+        self.assertEqual(self._decision(out), "deny")
+        self.assertIn("feat-b", self._reason(out))
+
     # --- Bash: reads keep today's behavior (ask, not deny) ------------------
 
     def test_bash_read_of_sibling_asks_not_deny(self):
@@ -4994,6 +5080,89 @@ class SiblingCheckoutTests(unittest.TestCase):
         # shell-expand) -> defer to builtin permissions.
         out = self._edit("Write", "$HOME/somewhere/x.txt")
         self.assertIsNone(out, f"expected defer, got {out!r}")
+
+
+class EntryOperandMaskTests(unittest.TestCase):
+    """Which file operands name a directory entry rather than file contents."""
+
+    def _mask(self, cmd):
+        toks = shlex.split(cmd)
+        mask = guard.entry_operand_mask(toks)
+        # The mask is only usable if it lines up with the file list it labels.
+        self.assertEqual(len(mask), len(guard.files_in_command(toks) or []),
+                         f"mask does not line up with files for {cmd!r}")
+        return mask
+
+    def test_rm_marks_every_operand(self):
+        self.assertEqual(self._mask("rm a b c"), [True, True, True])
+
+    def test_rm_flags_do_not_shift_the_mask(self):
+        self.assertEqual(self._mask("rm -rf -- a b"), [True, True])
+
+    def test_mv_marks_sources_but_not_the_destination(self):
+        self.assertEqual(self._mask("mv a b"), [True, False])
+        self.assertEqual(self._mask("mv a b destdir"), [True, True, False])
+
+    def test_mv_target_directory_flag_makes_every_positional_a_source(self):
+        # `-t DIR` is a file_flag, so DIR leads the file list and there is no
+        # positional destination to exclude.
+        self.assertEqual(self._mask("mv -t destdir a b"), [False, True, True])
+        self.assertEqual(self._mask("mv --target-directory=destdir a b"),
+                         [False, True, True])
+
+    def test_content_commands_mark_nothing(self):
+        self.assertEqual(self._mask("cat a b"), [False, False])
+        self.assertEqual(self._mask("cp a b"), [False, False])
+        self.assertEqual(self._mask("tee a"), [False])
+
+    def test_unguarded_command_has_no_mask(self):
+        self.assertEqual(guard.entry_operand_mask(["ls", "a"]), [])
+
+
+class EntryRealpathTests(unittest.TestCase):
+    """`realpath` with the final component left alone."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.base = os.path.realpath(self._tmp.name)
+        self.real = os.path.join(self.base, "real")
+        os.mkdir(self.real)
+        with open(os.path.join(self.real, "f.txt"), "w") as f:
+            f.write("x\n")
+        os.symlink(os.path.join(self.real, "f.txt"),
+                   os.path.join(self.base, "link"))
+        os.symlink(os.path.join(self.base, "nope"),
+                   os.path.join(self.base, "dangling"))
+        os.symlink(self.real, os.path.join(self.base, "dirlink"))
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def test_final_symlink_is_not_followed(self):
+        p = os.path.join(self.base, "link")
+        self.assertEqual(guard.entry_realpath(p), p)
+        self.assertEqual(os.path.realpath(p), os.path.join(self.real, "f.txt"))
+
+    def test_dangling_final_symlink_is_not_followed(self):
+        p = os.path.join(self.base, "dangling")
+        self.assertEqual(guard.entry_realpath(p), p)
+
+    def test_directory_symlink_in_the_middle_still_resolves(self):
+        p = os.path.join(self.base, "dirlink", "f.txt")
+        self.assertEqual(guard.entry_realpath(p),
+                         os.path.join(self.real, "f.txt"))
+
+    def test_plain_path_matches_realpath(self):
+        p = os.path.join(self.real, "f.txt")
+        self.assertEqual(guard.entry_realpath(p), os.path.realpath(p))
+
+    def test_trailing_slash_dot_and_dotdot_fall_back_to_realpath(self):
+        # None of these name an entry within a directory.
+        for raw in (os.path.join(self.base, "dirlink") + os.sep,
+                    os.path.join(self.base, "dirlink", os.curdir),
+                    os.path.join(self.base, "dirlink", os.pardir)):
+            self.assertEqual(guard.entry_realpath(raw), os.path.realpath(raw),
+                             f"diverged from realpath for {raw!r}")
 
 
 class ClassifyPkillTests(unittest.TestCase):
@@ -5866,6 +6035,177 @@ class ShellCSuppressesAllowTests(unittest.TestCase):
     def test_an_ordinary_guarded_command_still_allows(self):
         self._decision("cat in.txt", "allow")
         self._decision("grep -c foo in.txt", "allow")
+
+
+class InterpreterSuppressesAllowTests(unittest.TestCase):
+    """A clean guarded command never speaks for interpreter code (Q72).
+
+    `shell_c_group`'s rule one layer out. Measured at 0219b04:
+    `cat README.md && python3 -c '…'` came back `allow`, so the hook was
+    short-circuiting the user's own permission settings on arbitrary code — the
+    same defect Q60 fixed for `sh -c`, in a spelling `SHELL_C_CMDS` misses.
+
+    Interpreters stay out of `SPEC`: deferring on a bare `python3 x.py` is the
+    documented threat model. Only the blanket `allow` is withdrawn, and only for
+    code the hook cannot read — a script resolving *inside* the workspace is
+    repo-resident and still allows. Targets are synthetic (repo rule); nothing
+    here is ever executed.
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.workspace = os.path.realpath(self._tmp.name)
+        with open(os.path.join(self.workspace, "in.txt"), "w") as f:
+            f.write("hello\n")
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def _decision(self, cmd, expected):
+        out = run_hook(cmd, self.workspace, project_dir=self.workspace)
+        if expected == "defer":
+            self.assertIsNone(out, f"expected defer for {cmd!r}, got {out!r}")
+            return
+        self.assertIsNotNone(out, f"expected a decision, got defer for: {cmd!r}")
+        got = out["hookSpecificOutput"]["permissionDecision"]
+        self.assertEqual(got, expected, f"expected {expected!r} for {cmd!r}")
+
+    def test_inline_code_suppresses_the_allow(self):
+        # `-c` for python, `-e` for the perl/ruby/node family, and both read off
+        # short-option clusters so `perl -pe` and `perl -0pi -e` fire too.
+        for cmd in ("cat in.txt && python3 -c 'import os'",
+                    "cat in.txt && perl -e 'print 1'",
+                    "cat in.txt && perl -pe 's/a/b/' in.txt",
+                    "cat in.txt && perl -0pi -e 's/a/b/' in.txt",
+                    "cat in.txt && ruby -e 'puts 1'",
+                    "cat in.txt && node -e 'console.log(1)'"):
+            self._decision(cmd, "defer")
+
+    def test_stdin_and_heredoc_bodies_suppress_the_allow(self):
+        # The heredoc body is stripped before shlex, so the hook has nothing to
+        # read — the same blind spot as a `-c` operand, and far more common.
+        for cmd in ("cat in.txt && python3 - <<'PY'\nimport os\nPY",
+                    "cat in.txt && python3 <<'PY'\nimport os\nPY",
+                    "cat in.txt && python3"):
+            self._decision(cmd, "defer")
+
+    # An outside script is no longer merely suppressed — it is a real offender.
+    # See test_a_script_outside_the_workspace_is_a_real_offender below.
+
+    def test_a_workspace_resident_script_still_allows(self):
+        # Repo-resident code is what the boundary already trusts; exempting it
+        # is what keeps this rule from costing far more friction than it buys.
+        for cmd in ("cat in.txt && python3 ./scripts/run.py",
+                    "cat in.txt && bash ./script.sh",
+                    "cat in.txt && node subdir/app.js"):
+            self._decision(cmd, "allow")
+
+    def test_an_interpreter_on_another_filesystem_still_allows(self):
+        # Locality is decided the way `shell_c_bodies` decides it: the code runs
+        # on another host, so this workspace's boundary has nothing to say.
+        for cmd in ("cat in.txt && kubectl exec p -- python3 -c 'import os'",
+                    "cat in.txt && ssh host python3 /q72-fake-target/x.py",
+                    "cat in.txt && docker exec c ruby -e 'puts 1'"):
+            self._decision(cmd, "allow")
+
+    def test_a_local_wrapper_still_reaches_the_interpreter(self):
+        for cmd in ("cat in.txt && timeout 5 python3 -c 'import os'",
+                    "cat in.txt && env python3 -c 'import os'",
+                    "cat in.txt && nohup perl -e 'print 1'"):
+            self._decision(cmd, "defer")
+
+    def test_a_query_flag_runs_no_code_and_still_allows(self):
+        for cmd in ("cat in.txt; python3 --version", "cat in.txt; node --version",
+                    "cat in.txt; perl --help", "cat in.txt; python3 -V"):
+            self._decision(cmd, "allow")
+
+    def test_an_interpreter_name_in_a_pattern_does_not_suppress(self):
+        # The rule keys on the group's command word. A loose token scan would
+        # read these as interpreter invocations and defer a clean grep.
+        for cmd in ("grep -n 'kindest/node' in.txt",
+                    "grep -rn python3 in.txt",
+                    "cat in.txt | grep -c perl"):
+            self._decision(cmd, "allow")
+
+    def test_inline_code_on_its_own_still_defers(self):
+        # No guarded command, so there was never an `allow` to suppress, and
+        # inline code carries no path to check. Interpreters remain outside
+        # `SPEC`; only a script operand is treated as a file argument.
+        for cmd in ("python3 -c 'import os'", "perl -e 'print 1'",
+                    "python3 ./scripts/run.py"):
+            self._decision(cmd, "defer")
+
+    def test_an_outside_read_still_asks(self):
+        # The suppression withdraws `allow`; it must not mask a real offender.
+        self._decision("cat in.txt && cat /q72-fake-target/secret", "ask")
+
+    def test_a_script_outside_the_workspace_is_a_real_offender(self):
+        # Not merely suppressed: a script operand is a file the interpreter
+        # reads, so it is checked like any other read and yields `ask`. That is
+        # the part that survives the permission-mode matrix — a suppression only
+        # withholds `allow`, which still runs under `auto`/`acceptEdits`/
+        # `bypassPermissions` (docs/permission-modes.md).
+        for cmd in ("python3 /q72-fake-target/x.py",
+                    "bash /q72-fake-target/x.sh",
+                    "cat in.txt && ruby /q72-fake-target/x.rb"):
+            self._decision(cmd, "ask")
+
+    def test_an_outside_script_denies_under_bypass(self):
+        out = run_hook("python3 /q72-fake-target/x.py", self.workspace,
+                       project_dir=self.workspace,
+                       permission_mode="bypassPermissions")
+        self.assertIsNotNone(out)
+        self.assertEqual(out["hookSpecificOutput"]["permissionDecision"], "deny")
+
+    def test_a_remote_interpreter_script_is_not_an_offender(self):
+        # The path names another filesystem, so checking it here would block a
+        # file this host never touches.
+        self._decision("cat in.txt && ssh host python3 /q72-fake-target/x.py",
+                       "allow")
+
+
+class InstalledExtensionReadExemptionTests(unittest.TestCase):
+    """Installed plugin/skill code is read-exempt (Q72).
+
+    82% of outside-root interpreter script arguments in a measured corpus were
+    plugin scripts launched by a hook or skill, so without this the interpreter
+    check would prompt on the extension ecosystem and be turned off. Reads only.
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.workspace = os.path.realpath(self._tmp.name)
+        self._home = tempfile.TemporaryDirectory()
+        self.home = os.path.realpath(self._home.name)
+        self.env = {"HOME": self.home, "USERPROFILE": self.home}
+        for name in ("plugins", "skills"):
+            os.makedirs(os.path.join(self.home, ".claude", name), exist_ok=True)
+
+    def tearDown(self):
+        self._tmp.cleanup()
+        self._home.cleanup()
+
+    def _decision(self, cmd):
+        out = run_hook(cmd, self.workspace, project_dir=self.workspace,
+                       env_extra=self.env)
+        return None if out is None else \
+            out["hookSpecificOutput"]["permissionDecision"]
+
+    # The exempt case is tier-stable: `classify_outside` consults the read
+    # prefixes before the host-temp rule, so it answers the same on a platform
+    # where this fixture's temp home is itself host-temp. The two negative cases
+    # are not, so they assert only that SOME blocking tier was reached.
+    def test_reading_installed_plugin_code_is_exempt(self):
+        p = os.path.join(self.home, ".claude", "plugins", "p", "run.sh")
+        self.assertNotIn(self._decision(f"bash {sh(p)}"), ("ask", "deny"))
+
+    def test_writing_installed_plugin_code_is_not_exempt(self):
+        p = os.path.join(self.home, ".claude", "plugins", "p", "run.sh")
+        self.assertIn(self._decision(f"cp ./in.txt {sh(p)}"), ("ask", "deny"))
+
+    def test_an_unrelated_outside_script_is_not_exempt(self):
+        p = os.path.join(self.home, "elsewhere", "run.sh")
+        self.assertIn(self._decision(f"bash {sh(p)}"), ("ask", "deny"))
 
 
 class ShellCBodyAnalysisTests(unittest.TestCase):
