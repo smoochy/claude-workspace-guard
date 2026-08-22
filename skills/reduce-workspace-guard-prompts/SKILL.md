@@ -54,19 +54,27 @@ Either way, map what you find to a cause. The report's category names line up
 one-to-one with these:
 
 1. **A `$VAR`, `$(...)`, or leading `~` in a guarded file argument** — category
-   `expand`. The hook can't expand these, so it treats them as outside the root
-   and prompts — even when they'd resolve in-root. Reason starts with
+   `expand`. The hook can't expand these, so it can't tell where the command
+   lands — and neither could you at a prompt. It **denies** with the
+   literal-path rewrite instead of asking, so this class costs the agent a
+   retry rather than costing you a decision. Reason carries
    "Runtime-expanded arg(s)".
 2. **A bare `cd` / `cd -` / `cd $HOME`, a `popd`, or an unrecognized
    `$(...)` `cd` target** — category `untracked`. These lose the hook's
    working-directory tracking, so every later relative path in the same
-   command prompts. Reason starts with "Relative path(s) after an untracked
-   cd". (A *literal* `cd` target — even one outside the root — keeps
+   command is **denied**, with the literal-target rewrite in the reason, for
+   the same reason `expand` is. Reason carries "Relative path(s) after an
+   untracked cd". (A *literal* `cd` target — even one outside the root — keeps
    tracking; relative paths after it land in category `outside` instead,
    with the resolved absolute path named in the reason.)
 3. **A path that genuinely resolves outside the root** (including `../`
-   traversal, or temp files written to `/tmp`) — category `outside`. Reason
-   starts with "Outside-workspace path(s)".
+   traversal, or temp files written to `/tmp`) — category `outside`. This is
+   the one that still **prompts**: only you can say whether the file is yours
+   to read. Reason carries "Outside-workspace path(s)".
+
+Every blocking reason leads with `workspace-guard: ` — a **prompt** and a
+**deny** alike — and the category name follows it. So match the category name
+anywhere in the reason rather than at the start.
 
 The **top offending paths** and **top triggering commands** rankings tell you
 *which* files and commands to target first — fix the highest-count rows for the
@@ -96,6 +104,15 @@ Which bullets to walk through, by category:
 - `untracked` — the bullet on giving `cd` a literal target.
 - `outside` — the bullets on temp files, on out-of-tree dependency caches, and
   on editing through this session's own worktree checkout.
+- `hosttemp` — the bullet on writing temp files to this session's own
+  scratchpad rather than `/tmp`.
+- `sibling` — the bullet on editing through this session's own checkout.
+- `kill` — the bullet on never killing a process by an unanchored pattern.
+
+The last three are denies rather than prompts in the default configuration, so
+they surface a command that was blocked outright — say so when you quote the
+bullet, and name the env var that softens it (`WORKSPACE_GUARD_TMP_ACTION`,
+`WORKSPACE_GUARD_OVERRIDE`) rather than presenting the fix as the only route.
 
 Quote those bullets rather than summarizing them. They carry exact paths,
 preconditions, and exemption lists that a paraphrase drops — which is how this

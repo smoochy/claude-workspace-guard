@@ -18,11 +18,12 @@ ASSIGNMENT_RE = re.compile(r'^[A-Za-z_][A-Za-z0-9_]*=')
 # string; bash expands `$SP` deterministically, so the hook can too and run
 # the resolved path through the normal workspace check instead of flagging it
 # as runtime-expanded. Everything below only ever narrows what is propagated:
-# any uncertainty drops (poisons) the variable, which restores today's `ask`.
+# any uncertainty drops (poisons) the variable, which restores the
+# runtime-expanded `deny`.
 
 # A plain `$NAME` / `${NAME}` use. Parameter-expansion operators (`${f:-x}`,
 # `${f%.*}`, ...) deliberately don't match — the `$` stays in the token and
-# keeps the runtime-expanded `ask`.
+# keeps the runtime-expanded `deny`.
 VAR_USE_RE = re.compile(r'\$(?:\{([A-Za-z_][A-Za-z0-9_]*)\}|([A-Za-z_][A-Za-z0-9_]*))')
 
 IDENT_RE = re.compile(r'[A-Za-z_][A-Za-z0-9_]*')
@@ -1204,6 +1205,11 @@ def _consume_heredoc_body(text, i, delim, strip_tabs):
     return n
 
 
+# The `last` value that leaves the scanner at a command position, where a `#`
+# starts a comment — what bash sees just inside a `$(` or a backtick.
+SUBST_OPEN = '('
+
+
 def strip_heredoc_bodies(cmd, expanded=None):
     """Remove heredoc body text from the raw command string, before shlex.
 
@@ -1224,7 +1230,15 @@ def strip_heredoc_bodies(cmd, expanded=None):
     across a heredoc (Q67): no body line ever reaches the group loop.
 
     Command-line quote state is tracked so a `<<` inside a quoted string is not
-    mistaken for a heredoc; an unquoted `#` comment is skipped for `<<`
+    mistaken for a heredoc. A `$(…)` or backtick body opens a FRESH quote
+    context, as it does in bash, so a heredoc inside one is found even when the
+    substitution itself sits in double quotes — the shape a multi-paragraph
+    commit message takes (``git commit -F "$(cat <<'MSG' … MSG\n)"``). Tracked
+    flat, the enclosing `"` hid that `<<`, the body survived into shlex, and an
+    odd number of `"` in it aborted the parse of the WHOLE command, so a
+    guarded outside-workspace path later on the line went unchecked (issue 169).
+    The `(` depth of each context is counted so a subshell's `)` does not end
+    the substitution early. An unquoted `#` comment is skipped for `<<`
     detection (its text is left for ``strip_comments`` to remove). Arithmetic
     `$((a<<b))` / `((a<<b))` regions are copied verbatim — their `<<` is a shift,
     not a redirection, so they never arm a bogus delimiter. `<<<` here-strings
@@ -1247,6 +1261,8 @@ def strip_heredoc_bodies(cmd, expanded=None):
     in_single = in_double = False
     last = ''                                     # last emitted char (word start)
     pending = []                                  # (delim, strip_tabs) in order
+    depth = 0                                     # unclosed `(` in this context
+    stack = []                                    # (term, in_double, pending, depth)
     while i < n:
         c = cmd[i]
         if in_single:
@@ -1255,17 +1271,30 @@ def strip_heredoc_bodies(cmd, expanded=None):
                 in_single = False
             i += 1
             continue
-        if in_double:
-            if c == '\\' and i + 1 < n:
-                out.append(c); out.append(cmd[i+1]); last = cmd[i+1]; i += 2
+        if c == '\\' and i + 1 < n:               # escapes, quoted or not
+            out.append(c); out.append(cmd[i+1]); last = cmd[i+1]; i += 2
+            continue
+        # A substitution body is parsed in its own quote context, so these two
+        # openers are recognised whether or not a `"` is still open.
+        if c == '$' and i + 2 < n and cmd[i+1] == '(' and cmd[i+2] != '(':
+            stack.append((')', in_double, pending, depth))
+            in_double = False; pending = []; depth = 0
+            out.append('$('); last = SUBST_OPEN; i += 2
+            continue
+        if c == '`':
+            if stack and stack[-1][0] == '`':     # closes the body it opened
+                _, in_double, pending, depth = stack.pop()
+                out.append(c); last = c; i += 1
                 continue
+            stack.append(('`', in_double, pending, depth))
+            in_double = False; pending = []; depth = 0
+            out.append(c); last = SUBST_OPEN; i += 1
+            continue
+        if in_double:
             out.append(c); last = c
             if c == '"':
                 in_double = False
             i += 1
-            continue
-        if c == '\\' and i + 1 < n:
-            out.append(c); out.append(cmd[i+1]); last = cmd[i+1]; i += 2
             continue
         if c == "'":
             in_single = True; out.append(c); last = c; i += 1
@@ -1281,6 +1310,17 @@ def strip_heredoc_bodies(cmd, expanded=None):
         if c == '(' and i + 1 < n and cmd[i+1] == '(':
             end = _skip_balanced_parens(cmd, i)   # `((…))` / `$((…))` arithmetic
             out.append(cmd[i:end]); last = ')'; i = end
+            continue
+        if c == '(':
+            depth += 1                            # subshell — not our terminator
+            out.append(c); last = c; i += 1
+            continue
+        if c == ')':
+            if depth:
+                depth -= 1
+            elif stack and stack[-1][0] == ')':
+                _, in_double, pending, depth = stack.pop()
+            out.append(c); last = c; i += 1
             continue
         if c == '<' and i + 1 < n and cmd[i+1] == '<':
             if i + 2 < n and cmd[i+2] == '<':     # `<<<` here-string, not heredoc
@@ -1680,7 +1720,7 @@ def expand_loop_candidates(tok, loopmap):
     Returns None when that cross product would exceed MAX_LOOP_CANDIDATES — its
     size is the product of the per-variable candidate counts, so it is known
     before any expansion happens and the work is never done (Q46). Callers treat
-    None as a poison: the token keeps the runtime-expanded ``ask`` it had before
+    None as a poison: the token keeps the runtime-expanded ``deny`` it had before
     loop propagation existed. It is deliberately not a truncation to the first N
     candidates, which would check a prefix and silently allow the rest.
     """
@@ -1712,7 +1752,7 @@ def substitute_vars(tok, varmap):
     """Replace plain `$NAME`/`${NAME}` uses whose literal value is known.
 
     Unknown names are left in place (the remaining `$` keeps today's
-    runtime-expanded `ask`). Tokens containing backticks are returned
+    runtime-expanded `deny`). Tokens containing backticks are returned
     untouched: they hold old-style command substitution the hook can't
     evaluate, and leaving the `$` alone keeps the secure default.
     """
@@ -1741,7 +1781,7 @@ def apply_assignment_group(g, varmap, persists):
     group can't persist to later commands (``persists`` False: inside a
     subshell, a pipeline segment, or backgrounded), or when bash treats the
     name specially (NEVER_PROPAGATE). Dropping only ever restores the
-    runtime-expanded `ask`. A bare ``export NAME`` re-exports without
+    runtime-expanded `deny`. A bare ``export NAME`` re-exports without
     changing the value, so it neither sets nor drops.
     """
     toks = g
@@ -2800,7 +2840,7 @@ def resolve_subst_prefix(tok, group_cwd):
     with the remainder (matching bash — no path separator is inserted, so
     ``$(pwd)x`` becomes ``<pwd>x`` not ``<pwd>/x``), which means any ``$``/``~``
     or further substitution left in the remainder still trips the caller's
-    ``EXPANSION_RE`` / tilde checks and keeps the runtime-expanded ``ask``. An
+    ``EXPANSION_RE`` / tilde checks and keeps the runtime-expanded ``deny``. An
     unresolvable substitution (no ``.git`` boundary, git-discovery env vars set)
     returns ``tok`` unchanged, keeping the secure default. The caller gates this
     on a known ``group_cwd`` — ``pwd``/toplevel both depend on it.
@@ -3179,20 +3219,52 @@ def classify_outside(rp, ctx, is_read):
     return ('outside', None)
 
 
+# Blocking reasons lead with the guard's own name. Claude Code names the plugin
+# in neither the `ask` prompt nor the text handed back from a `deny`, so for both
+# verdicts this opener is the only trace of which hook stopped the command — the
+# operator answering a prompt and the agent reading a refusal are in the same
+# position. `allow` keeps the bare reason: nothing is surfaced to either of them,
+# and the decision stream that does carry it also carries `hookName` and the hook
+# `command`. The `<name>-guard: ` shape is a cross-guard convention
+# (foreground-guard's friction report parses it as `DENY_TEXT`), so a guard that
+# words its opener differently under-counts itself there.
+ATTRIBUTION = 'workspace-guard: '
+
+
+# Categories the hook failed to *parse*, as against ones it judged. Both name a
+# token whose destination the hook can't see — a shape it can't expand (`$f`,
+# `$TMPDIR/out.log`), or a relative path after a `cd` it couldn't follow — and
+# for both, `build_reason` already spells out the literal rewrite that resolves
+# it. The operator at an `ask` prompt sees the same unexpanded string the agent
+# does and holds no fact it lacks, so routing this class to a human buys a wait
+# and no information. It denies instead: the agent applies the rewrite in its
+# own loop, and a literal that then lands outside the root comes back as an
+# 'outside' ask on a path a person can actually judge. That moves the boundary
+# question to where it can be answered rather than removing it.
+UNPARSED_CATS = frozenset({'expand', 'untracked'})
+
+
 def decide(offenders, ctx, bypass):
     """Map a non-empty ``offenders`` list to a ``(decision, reason)`` pair.
 
     Shared final step for every handler. ``deny`` when running under
     ``bypassPermissions`` (no human to answer an ask), when a host-temp path is
-    hit and the configured action is ``deny``, or when a sibling-checkout write
-    or an unanchored process kill is hit without an override; otherwise ``ask``.
+    hit and the configured action is ``deny``, when a sibling-checkout write or
+    an unanchored process kill is hit without an override, or when every
+    offender is one the hook merely failed to parse (``UNPARSED_CATS``);
+    otherwise ``ask``.
     Both decisions block equally — this is a recoverability/steering choice, not
-    a weakening of the boundary."""
-    host_temp_hit = any(cat == 'hosttemp' for _, cat, _ in offenders)
-    cross_hit = any(cat in ('sibling', 'kill') for _, cat, _ in offenders)
+    a weakening of the boundary. Both are prefixed with ``ATTRIBUTION``, since
+    neither the prompt nor the refusal text names the plugin on its own."""
+    cats = {cat for _, cat, _ in offenders}
+    host_temp_hit = 'hosttemp' in cats
+    cross_hit = bool(cats & {'sibling', 'kill'})
     cross_deny = cross_hit and ctx.override is None
+    # Every offender, not any: a command that also names a genuinely outside
+    # path keeps the `ask` that path is owed.
+    unparsed_only = bool(cats) and cats <= UNPARSED_CATS
     deny_now = bypass or (host_temp_hit and ctx.tmp_action == 'deny') \
-        or cross_deny
+        or cross_deny or unparsed_only
     decision = "deny" if deny_now else "ask"
     reason = build_reason(offenders,
                           build_scratch_hint(
@@ -3200,7 +3272,7 @@ def decide(offenders, ctx, bypass):
                               session_scratchpad(ctx.session_id,
                                                  ctx.session_proj_dir)),
                           override=ctx.override)
-    return decision, reason
+    return decision, ATTRIBUTION + reason
 
 
 def resolve_native_path(raw, cwd):
@@ -3399,9 +3471,11 @@ def _analyze_command(cmd, ctx, base_cwd, depth=0, in_subst=False, seed_vars=None
                                    outside.
           ('path', abspath)      — caller compares against the workspace and
                                    the staged-outside set
-        Both 'expand' and 'untracked' are treated identically to a resolved
-        outside path by the decision logic — they only differ in the advice
-        the reason string surfaces.
+        Both 'expand' and 'untracked' block like a resolved outside path, but
+        as a `deny` carrying the literal rewrite rather than an `ask` (see
+        UNPARSED_CATS) — the hook failed to read them, and a human at a prompt
+        can't expand them either. They differ from each other only in the
+        advice the reason string surfaces.
 
         `entry=True` marks an operand that names a directory entry rather than
         the contents of what it points at (see ENTRY_OPERANDS), and resolves it
@@ -3453,8 +3527,10 @@ def _analyze_command(cmd, ctx, base_cwd, depth=0, in_subst=False, seed_vars=None
         `category` is one of 'sibling' (a WRITE into a sibling checkout of the
         same repo), 'outside' (a resolved path outside the root), 'expand' (a
         runtime-expanded `~`/`$` token), or 'untracked' (a relative path after a
-        `cd` we couldn't follow). All block identically; the category steers the
-        advice, and 'sibling' additionally carries a `detail` dict (else None).
+        `cd` we couldn't follow). All block; the category steers both the
+        advice and the verdict — the two the hook merely failed to parse deny
+        with a rewrite (UNPARSED_CATS), the rest ask — and 'sibling'
+        additionally carries a `detail` dict (else None).
 
         `is_read=True` enables the ALLOWED_READ_PREFIXES exemption for
         commands that only read files (see WRITE_COMMANDS). Redirect
@@ -4888,11 +4964,11 @@ def handle_powershell(data):
     """
     ti = data.get('tool_input')
     if not isinstance(ti, dict) or not isinstance(ti.get('command'), str):
-        emit("ask", "workspace-guard could not read the PowerShell tool's "
-                    "command (tool_input.command), so it checked nothing about "
-                    "this command's file access. Approve only if you have read "
-                    "the command yourself, and please report this — the guard "
-                    "is meant to check every shell command.")
+        emit("ask", ATTRIBUTION + "could not read the PowerShell tool's "
+                    "command (tool_input.command), so nothing about this "
+                    "command's file access was checked. Approve only if you "
+                    "have read the command yourself, and please report this — "
+                    "the guard is meant to check every shell command.")
         return
     cmd = ti['command']
     if not cmd.strip():
